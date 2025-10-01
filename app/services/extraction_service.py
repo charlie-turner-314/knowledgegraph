@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,9 +47,42 @@ class ExtractionOrchestrator:
         self.candidates = CandidateRepository(session)
         self.canonicals = CanonicalTermRepository(session)
         self.llm_client = llm_client or get_client()
+        self._canonical_context_cache: Optional[List[dict]] = None
 
     def ingest_file(self, path: Path) -> IngestionResult:
         parsed = parse_document(path)
+        return self._ingest_parsed_document(parsed)
+
+    def ingest_text(
+        self,
+        *,
+        text: str,
+        title: Optional[str] = None,
+        media_type: str = "text/plain",
+    ) -> IngestionResult:
+        cleaned = text.strip()
+        if not cleaned:
+            raise ValueError("Text input cannot be empty.")
+
+        checksum = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
+        parsed = ParsedDocument(
+            display_name=title.strip() if title and title.strip() else "Manual Entry",
+            media_type=media_type,
+            checksum=checksum,
+            chunks=[
+                ChunkPayload(
+                    ordering=0,
+                    text=cleaned,
+                    page_label="manual",
+                    token_count=len(cleaned.split()),
+                )
+            ],
+            original_path=None,
+            extra={"source": "manual_input"},
+        )
+        return self._ingest_parsed_document(parsed)
+
+    def _ingest_parsed_document(self, parsed: ParsedDocument) -> IngestionResult:
         existing_doc = self.documents.get_by_checksum(parsed.checksum)
         was_existing = existing_doc is not None
 
@@ -91,8 +125,9 @@ class ExtractionOrchestrator:
     ) -> List[models.CandidateTriple]:
         candidates: List[models.CandidateTriple] = []
         seen_triples = set()
+        canonical_context = self._canonical_prompt_context()
         for chunk in chunks:
-            response = self._call_extractor(chunk)
+            response = self._call_extractor(chunk, canonical_context)
             for triple in response.triples:
                 key = (
                     triple.subject.strip(),
@@ -118,14 +153,22 @@ class ExtractionOrchestrator:
         self.session.flush()
         return candidates
 
-    def _call_extractor(self, chunk: models.DocumentChunk) -> ExtractionResponse:
+    def _call_extractor(
+        self,
+        chunk: models.DocumentChunk,
+        canonical_context: List[dict],
+    ) -> ExtractionResponse:
         metadata = {
             "chunk_id": chunk.id,
             "document_id": chunk.document_id,
             "page_label": chunk.page_label,
         }
         try:
-            return self.llm_client.extract_triples(chunk_text=chunk.text, metadata=metadata)
+            return self.llm_client.extract_triples(
+                chunk_text=chunk.text,
+                metadata=metadata,
+                canonical_context=canonical_context,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("LLM extraction failed for chunk %s", chunk.id)
             # Return empty response preserving raw error for debugging
@@ -159,3 +202,19 @@ class ExtractionOrchestrator:
             duplicate_of_candidate_id=duplicate_of.id if duplicate_of else None,
             is_potential_duplicate=is_duplicate,
         )
+
+    def _canonical_prompt_context(self) -> List[dict]:
+        if self._canonical_context_cache is not None:
+            return self._canonical_context_cache
+        terms = self.canonicals.list_terms()
+        context: List[dict] = []
+        for term in terms:
+            payload = {
+                "label": term.label,
+                "aliases": term.aliases or [],
+            }
+            if term.entity_type:
+                payload["entity_type"] = term.entity_type
+            context.append(payload)
+        self._canonical_context_cache = context
+        return context

@@ -5,7 +5,7 @@ import streamlit as st
 from app.core.config import settings
 from app.core import logging as _logging  # noqa: F401 ensures logging configured
 from app.data.db import init_db
-from app.ui import query, review, upload, visualization
+from app.ui import manage, query, review, upload, visualization
 
 
 TAB_MAP = {
@@ -13,6 +13,7 @@ TAB_MAP = {
     "Review": review.render,
     "Visualize": visualization.render,
     "Query": query.render,
+    "Manage": manage.render,
 }
 
 

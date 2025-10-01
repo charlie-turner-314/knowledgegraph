@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Iterable, List, Optional, Sequence
 
 from sqlalchemy.orm import selectinload
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from . import models
 
@@ -20,6 +20,14 @@ class DocumentRepository:
             .options(selectinload(models.Document.chunks))
         )
         return self.session.exec(statement).first()
+
+    def list_documents(self) -> List[models.Document]:
+        statement = (
+            select(models.Document)
+            .options(selectinload(models.Document.chunks))
+            .order_by(models.Document.created_at.desc())
+        )
+        return list(self.session.exec(statement))
 
     def create_document(
         self,
@@ -54,6 +62,49 @@ class DocumentRepository:
         self.session.flush()
         return stored
 
+    def delete_document(self, document: models.Document) -> None:
+        # Delete edge sources tied to this document's chunks first to maintain referential integrity
+        chunk_ids = [chunk.id for chunk in document.chunks]
+        if chunk_ids:
+            # Load edge sources via select to avoid hitting ORM cascades unexpectedly
+            sources_stmt = select(models.EdgeSource).where(
+                models.EdgeSource.document_chunk_id.in_(chunk_ids)
+            )
+            sources = list(self.session.exec(sources_stmt))
+            edge_ids_to_check: set[int] = set()
+            for source in sources:
+                edge_ids_to_check.add(source.edge_id)
+                self.session.delete(source)
+
+            if edge_ids_to_check:
+                edges_stmt = select(models.Edge).where(models.Edge.id.in_(edge_ids_to_check))
+                edges = list(self.session.exec(edges_stmt))
+                for edge in edges:
+                    if not edge.sources:
+                        self.session.delete(edge)
+
+                # Remove nodes that no longer participate in any edges
+                orphan_nodes_stmt = select(models.Node).where(
+                    ~models.Node.outgoing_edges.any(),
+                    ~models.Node.incoming_edges.any(),
+                )
+                for node in self.session.exec(orphan_nodes_stmt):
+                    self.session.delete(node)
+
+        # Delete candidate triples tied to these chunks
+        if chunk_ids:
+            candidates_stmt = select(models.CandidateTriple).where(
+                models.CandidateTriple.chunk_id.in_(chunk_ids)
+            )
+            for candidate in self.session.exec(candidates_stmt):
+                self.session.delete(candidate)
+
+        # Delete chunks themselves
+        for chunk in document.chunks:
+            self.session.delete(chunk)
+
+        self.session.delete(document)
+
 
 class CanonicalTermRepository:
     def __init__(self, session: Session):
@@ -66,6 +117,12 @@ class CanonicalTermRepository:
     def add_alias(self, term: models.CanonicalTerm, alias: str) -> None:
         if alias not in term.aliases:
             term.aliases.append(alias)
+            term.last_reviewed_at = datetime.utcnow()
+            self.session.add(term)
+
+    def remove_alias(self, term: models.CanonicalTerm, alias: str) -> None:
+        if alias in term.aliases:
+            term.aliases.remove(alias)
             term.last_reviewed_at = datetime.utcnow()
             self.session.add(term)
 
@@ -92,6 +149,20 @@ class CanonicalTermRepository:
         self.session.add(term)
         self.session.flush()
         return term
+
+    def list_terms(self) -> List[models.CanonicalTerm]:
+        statement = select(models.CanonicalTerm).order_by(models.CanonicalTerm.label)
+        return list(self.session.exec(statement))
+
+    def delete(self, term: models.CanonicalTerm) -> None:
+        # Nullify canonical references in nodes
+        nodes_stmt = select(models.Node).where(models.Node.canonical_term_id == term.id)
+        for node in self.session.exec(nodes_stmt):
+            node.canonical_term_id = None
+            node.sme_override = True
+            self.session.add(node)
+
+        self.session.delete(term)
 
 
 class NodeRepository:
@@ -155,6 +226,15 @@ class CandidateRepository:
             .limit(limit)
         )
         return list(self.session.exec(statement))
+
+    def count_for_document(self, document_id: int) -> int:
+        statement = (
+            select(func.count())
+            .select_from(models.CandidateTriple)
+            .join(models.DocumentChunk, models.CandidateTriple.chunk_id == models.DocumentChunk.id)
+            .where(models.DocumentChunk.document_id == document_id)
+        )
+        return self.session.exec(statement).one()[0]
 
     def find_similar(
         self,
@@ -253,6 +333,16 @@ class GraphRepository:
             self.session.add(source)
 
         return edge
+
+    def count_edges_for_document(self, document_id: int) -> int:
+        statement = (
+            select(func.count(func.distinct(models.Edge.id)))
+            .select_from(models.Edge)
+            .join(models.EdgeSource)
+            .join(models.DocumentChunk)
+            .where(models.DocumentChunk.document_id == document_id)
+        )
+        return self.session.exec(statement).one()[0]
 
 
 class SMEActionRepository:

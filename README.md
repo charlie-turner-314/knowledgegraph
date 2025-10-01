@@ -3,9 +3,11 @@
 MVP Streamlit application for building a Gemma-assisted knowledge graph from locally ingested documents. SMEs upload source files, vet LLM-generated triples, and explore/query the approved graph with provenance retained for every edge.
 
 ## Features
-- Upload PDFs, DOCX, PPTX, or plaintext; files are chunked and stored locally with SHA256-based deduping.
+- Upload PDFs, DOCX, PPTX, plaintext, or paste raw text; content is chunked and stored locally with SHA256-based deduping.
 - Re-ingesting the same document regenerates triples while flagging potential duplicates for SME review.
 - Gemma 3 extraction client (stubbed by default) produces candidate subject–predicate–object triples per chunk, preserving the raw LLM response for audit.
+- All LLM prompts live under `resources/prompts/` so SMEs can audit or adjust instructions (e.g., canonical terminology enforcement).
+- Admin tab lets SMEs curate canonical terms/aliases and delete ingested documents along with associated graph knowledge.
 - Review queue lets the SME accept/reject/edit triples. Approved triples immediately create graph nodes/edges and provenance links back to their source chunks and SME actions.
 - Graph visualization tab (NetworkX + PyVis) with document-based filters and hover tooltips showing provenance context.
 - Natural-language query tab with chat-style interface. Until the Gemma query planner is integrated, it performs keyword-based graph lookups and returns supporting triples with citations.

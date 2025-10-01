@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import functools
 import logging
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import orjson
 import requests
@@ -9,9 +11,22 @@ from tenacity import RetryError, retry, stop_after_attempt, wait_random_exponent
 
 from app.core.config import settings
 
-from .schemas import ExtractionResponse, ExtractionTriple
+from .schemas import ExtractionResponse
 
 logger = logging.getLogger(__name__)
+
+PROMPT_PATH = (
+    Path(__file__).resolve().parents[1] / "resources" / "prompts" / "extraction_system_prompt.txt"
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _load_system_prompt() -> str:
+    try:
+        return PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.warning("System prompt file %s missing; using fallback text", PROMPT_PATH)
+        return "You extract subject-predicate-object triples from text and respond with JSON."
 
 
 class GemmaClient:
@@ -29,7 +44,13 @@ class GemmaClient:
         response.raise_for_status()
         return response.json()
 
-    def extract_triples(self, *, chunk_text: str, metadata: Optional[Dict[str, Any]] = None) -> ExtractionResponse:
+    def extract_triples(
+        self,
+        *,
+        chunk_text: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        canonical_context: Optional[List[Dict[str, Any]]] = None,
+    ) -> ExtractionResponse:
         """Call Gemma to extract triples from a chunk of text."""
 
         if self._dry_run:
@@ -40,25 +61,45 @@ class GemmaClient:
             )
             return stub
 
-        payload = {
-            "model": "gemma-3-27b-instruct",  # placeholder
-            "messages": [
+        system_prompt = _load_system_prompt()
+        messages: List[Dict[str, str]] = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+        ]
+
+        if canonical_context:
+            canonical_payload = {"canonical_terms": canonical_context}
+            messages.append(
                 {
                     "role": "system",
-                    "content": "You extract subject-predicate-object triples from text.",
-                },
+                    "content": (
+                        "Canonical vocabulary for this project (JSON). Use labels when aliases match.\n"
+                        f"{orjson.dumps(canonical_payload).decode()}"
+                    ),
+                }
+            )
+
+        messages.extend(
+            [
                 {
                     "role": "user",
                     "content": (
                         "Extract knowledge triples from the following text. "
-                        "Limit predicates to three words. Return JSON with triples array." 
+                        "Limit predicates to three words. Return JSON with triples array."
                     ),
                 },
                 {
                     "role": "user",
                     "content": chunk_text,
                 },
-            ],
+            ]
+        )
+
+        payload = {
+            "model": "gemma-3-27b-instruct",  # placeholder
+            "messages": messages,
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
         }
