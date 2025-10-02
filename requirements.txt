@@ -1,6 +1,7 @@
 streamlit>=1.35,<1.40
 sqlmodel>=0.0.16
 sqlalchemy>=2.0
+numpy>=1.26
 pydantic>=2.7
 pydantic-settings>=2.4
 alembic>=1.13
@@ -19,3 +20,4 @@ tenacity>=8.2
 orjson>=3.10
 rapidfuzz>=3.8
 tiktoken>=0.7
+sentence-transformers>=2.5

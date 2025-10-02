@@ -34,6 +34,9 @@ class ReviewService:
         predicate_override: Optional[str] = None,
         object_override: Optional[str] = None,
         notes: Optional[str] = None,
+        subject_attributes: Optional[List[Dict[str, object]]] = None,
+        object_attributes: Optional[List[Dict[str, object]]] = None,
+        tags: Optional[List[str]] = None,
     ) -> models.Edge:
         candidate = self._load_candidate(candidate_id)
         if candidate.status != models.CandidateStatus.pending:
@@ -66,6 +69,9 @@ class ReviewService:
             candidate=candidate,
             document_chunk=candidate.chunk,
             sme_action=action if notes else None,
+            subject_attributes=subject_attributes,
+            object_attributes=object_attributes,
+            tags=tags,
             created_by=actor,
         )
 

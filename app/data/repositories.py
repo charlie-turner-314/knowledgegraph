@@ -1,17 +1,25 @@
 from __future__ import annotations
 
-import os
-import faiss
-import numpy as np
-from typing import List, Tuple
+import json
+import logging
+import threading
 from datetime import datetime
-from typing import Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sentence_transformers import SentenceTransformer
+import numpy as np
+from rapidfuzz import fuzz
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, func, select
 
+try:  # pragma: no cover - optional dependency
+    from sentence_transformers import SentenceTransformer
+except ImportError:  # pragma: no cover - optional dependency
+    SentenceTransformer = None
+
 from . import models
+
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentRepository:
@@ -175,7 +183,11 @@ class NodeRepository:
         self.session = session
 
     def get_by_label(self, label: str) -> Optional[models.Node]:
-        statement = select(models.Node).where(models.Node.label == label)
+        statement = (
+            select(models.Node)
+            .where(models.Node.label == label)
+            .options(selectinload(models.Node.attributes))
+        )
         return self.session.exec(statement).first()
 
     def ensure_node(
@@ -201,6 +213,57 @@ class NodeRepository:
         self.session.flush()
         return node
 
+
+class NodeAttributeRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def upsert_many(
+        self,
+        node: models.Node,
+        attributes: Sequence[Dict[str, object]],
+    ) -> None:
+        if not attributes:
+            return
+        existing = {
+            attr.name.lower(): attr for attr in (node.attributes or [])
+        }
+
+        for payload in attributes:
+            name = str(payload.get("name", "")).strip()
+            if not name:
+                continue
+            key = name.lower()
+            data_type = payload.get("data_type", models.NodeAttributeType.string)
+            if isinstance(data_type, str):
+                try:
+                    data_type_enum = models.NodeAttributeType(data_type)
+                except ValueError:
+                    data_type_enum = models.NodeAttributeType.string
+            else:
+                data_type_enum = data_type
+
+            value_text = payload.get("value_text")
+            value_number = payload.get("value_number")
+            value_boolean = payload.get("value_boolean")
+
+            record = existing.get(key)
+            if record is None:
+                record = models.NodeAttribute(
+                    node_id=node.id,
+                    name=name,
+                    data_type=data_type_enum,
+                )
+                self.session.add(record)
+                if node.attributes is not None:
+                    node.attributes.append(record)
+            elif node.attributes is not None and record not in node.attributes:
+                node.attributes.append(record)
+            record.data_type = data_type_enum
+            record.value_text = value_text
+            record.value_number = value_number
+            record.value_boolean = value_boolean
+            record.updated_at = datetime.utcnow()
 
 class CandidateRepository:
     def __init__(self, session: Session):
@@ -274,6 +337,10 @@ class GraphRepository:
     def __init__(self, session: Session):
         self.session = session
         self.nodes = NodeRepository(session)
+        self.node_attributes = NodeAttributeRepository(session)
+        self._embedding_store = NodeEmbeddingStore()
+        if not self._embedding_store.has_entries():
+            self._embedding_store.bootstrap_from_session(session)
 
     def create_edge_with_provenance(
         self,
@@ -288,6 +355,9 @@ class GraphRepository:
         candidate: Optional[models.CandidateTriple],
         document_chunk: Optional[models.DocumentChunk],
         sme_action: Optional[models.SMEAction],
+        subject_attributes: Optional[Sequence[Dict[str, object]]] = None,
+        object_attributes: Optional[Sequence[Dict[str, object]]] = None,
+        tags: Optional[Sequence[str]] = None,
         created_by: Optional[str] = None,
     ) -> models.Edge:
         subject_node = self.nodes.ensure_node(
@@ -302,6 +372,13 @@ class GraphRepository:
             canonical_term=canonical_object,
             sme_override=canonical_object is None,
         )
+
+        if subject_attributes:
+            self.node_attributes.upsert_many(subject_node, subject_attributes)
+        if object_attributes:
+            self.node_attributes.upsert_many(object_node, object_attributes)
+
+        self._embedding_store.bulk_add([subject_node.label, object_node.label])
 
         edge = models.Edge(
             subject_node_id=subject_node.id,
@@ -336,6 +413,20 @@ class GraphRepository:
 
         for source in source_records:
             self.session.add(source)
+
+        if tags:
+            normalized_tags = {
+                tag.strip().lower()
+                for tag in tags
+                if isinstance(tag, str) and tag.strip()
+            }
+            for tag in sorted(normalized_tags):
+                self.session.add(
+                    models.EdgeTag(
+                        edge_id=edge.id,
+                        label=tag,
+                    )
+                )
 
         return edge
 
@@ -394,47 +485,255 @@ class SMEActionRepository:
         return action
 
 
+class OntologySuggestionRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get(self, suggestion_id: int) -> Optional[models.OntologySuggestion]:
+        return self.session.get(models.OntologySuggestion, suggestion_id)
+
+    def list_pending(self, limit: int = 20) -> List[models.OntologySuggestion]:
+        statement = (
+            select(models.OntologySuggestion)
+            .where(models.OntologySuggestion.status == models.OntologySuggestionStatus.pending)
+            .order_by(models.OntologySuggestion.created_at)
+            .limit(limit)
+        )
+        return list(self.session.exec(statement))
+
+    def find_for_nodes(
+        self,
+        node_ids: Sequence[int],
+        *,
+        predicate: str = "is_a",
+        statuses: Optional[Sequence[models.OntologySuggestionStatus]] = None,
+    ) -> Optional[models.OntologySuggestion]:
+        if not node_ids:
+            return None
+        status_filter = tuple(statuses) if statuses else (models.OntologySuggestionStatus.pending,)
+        sorted_ids = sorted(int(node_id) for node_id in node_ids)
+        statement = (
+            select(models.OntologySuggestion)
+            .where(models.OntologySuggestion.predicate == predicate)
+            .where(models.OntologySuggestion.status.in_(status_filter))
+        )
+        for candidate in self.session.exec(statement):
+            if sorted((candidate.supporting_node_ids or [])) == sorted_ids:
+                return candidate
+        return None
+
+    def create_suggestion(
+        self,
+        *,
+        parent_label: str,
+        predicate: str,
+        supporting_node_ids: Sequence[int],
+        supporting_node_labels: Sequence[str],
+        evidence: Dict[str, object],
+        guardrail_flags: Sequence[str],
+        confidence: float,
+        llm_confidence: Optional[float],
+        llm_rationale: Optional[str],
+        raw_llm_response: Optional[Dict[str, object]],
+        parent_description: Optional[str],
+        created_by: Optional[str] = "ontology_inference",
+    ) -> models.OntologySuggestion:
+        sorted_ids = sorted(dict.fromkeys(int(node_id) for node_id in supporting_node_ids))
+        suggestion = models.OntologySuggestion(
+            parent_label=parent_label,
+            parent_description=parent_description,
+            predicate=predicate,
+            supporting_node_ids=sorted_ids,
+            supporting_node_labels=list(supporting_node_labels),
+            evidence=dict(evidence),
+            guardrail_flags=list(guardrail_flags),
+            confidence=float(confidence),
+            llm_confidence=float(llm_confidence) if llm_confidence is not None else None,
+            llm_rationale=llm_rationale,
+            raw_llm_response=json.dumps(raw_llm_response, ensure_ascii=False)
+            if raw_llm_response is not None
+            else None,
+            created_by=created_by,
+        )
+        now = datetime.utcnow()
+        suggestion.created_at = now
+        suggestion.updated_at = now
+        self.session.add(suggestion)
+        self.session.flush()
+        return suggestion
+
+    def update_status(
+        self,
+        suggestion: models.OntologySuggestion,
+        *,
+        status: models.OntologySuggestionStatus,
+        applied_parent_node_id: Optional[int] = None,
+    ) -> models.OntologySuggestion:
+        suggestion.status = status
+        suggestion.updated_at = datetime.utcnow()
+        if applied_parent_node_id is not None:
+            suggestion.applied_parent_node_id = applied_parent_node_id
+        self.session.add(suggestion)
+        return suggestion
+
+
 class NodeEmbeddingStore:
-    def __init__(self, index_path: str = "node_index.faiss", embedding_model: str = "all-MiniLM-L6-v2"):
-        self.index_path = index_path
-        self.model = SentenceTransformer(embedding_model)
-        self.index = None
-        self.labels = []
-        self.label_to_vector = {}
+    _MODEL_CACHE: Optional[SentenceTransformer] = None
+    _MODEL_NAME: Optional[str] = None
+    _BACKEND: str = "fuzzy"
+    _LABELS: List[str] = []
+    _LABEL_TO_INDEX: Dict[str, int] = {}
+    _VECTORS: Optional[np.ndarray] = None
+    _LOCK = threading.Lock()
 
-        if os.path.exists(index_path):
-            self.index = faiss.read_index(index_path)
-            self._load_labels()
-        else:
-            self.index = faiss.IndexFlatL2(self.model.get_sentence_embedding_dimension())
+    def __init__(self, embedding_model: str = "all-MiniLM-L6-v2"):
+        self.embedding_model = embedding_model
+        if SentenceTransformer and NodeEmbeddingStore._MODEL_CACHE is None:
+            try:
+                NodeEmbeddingStore._MODEL_CACHE = SentenceTransformer(embedding_model)
+                NodeEmbeddingStore._MODEL_NAME = embedding_model
+                NodeEmbeddingStore._BACKEND = "embedding"
+            except Exception:  # pragma: no cover - optional dependency load failure
+                logger.exception(
+                    "Failed to load embedding model '%s'. Falling back to fuzzy matching.",
+                    embedding_model,
+                )
+                NodeEmbeddingStore._MODEL_CACHE = None
+                NodeEmbeddingStore._MODEL_NAME = None
+                NodeEmbeddingStore._BACKEND = "fuzzy"
+        elif SentenceTransformer is None:
+            NodeEmbeddingStore._BACKEND = "fuzzy"
+        elif (
+            NodeEmbeddingStore._BACKEND == "embedding"
+            and NodeEmbeddingStore._MODEL_NAME
+            and NodeEmbeddingStore._MODEL_NAME != embedding_model
+        ):
+            logger.warning(
+                "NodeEmbeddingStore already initialised with model '%s'; ignoring request for '%s'.",
+                NodeEmbeddingStore._MODEL_NAME,
+                embedding_model,
+            )
 
-    def _load_labels(self):
-        labels_path = self.index_path + ".labels"
-        if os.path.exists(labels_path):
-            with open(labels_path, "r", encoding="utf-8") as f:
-                self.labels = [line.strip() for line in f.readlines()]
+    @property
+    def backend(self) -> str:
+        return NodeEmbeddingStore._BACKEND
 
-    def _save_labels(self):
-        labels_path = self.index_path + ".labels"
-        with open(labels_path, "w", encoding="utf-8") as f:
-            for label in self.labels:
-                f.write(label + "\n")
+    def has_entries(self) -> bool:
+        return bool(NodeEmbeddingStore._LABELS)
 
-    def add_node(self, label: str):
-        if label in self.labels:
+    def encode_labels(self, labels: Sequence[str]) -> Optional[np.ndarray]:
+        if NodeEmbeddingStore._BACKEND != "embedding" or NodeEmbeddingStore._MODEL_CACHE is None:
+            return None
+        if not labels:
+            dimension = NodeEmbeddingStore._MODEL_CACHE.get_sentence_embedding_dimension()
+            return np.empty((0, dimension))
+        return NodeEmbeddingStore._MODEL_CACHE.encode(
+            list(labels),
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+
+    def bulk_add(self, labels: Sequence[str]) -> None:
+        cleaned = [label.strip() for label in labels if label and isinstance(label, str) and label.strip()]
+        if not cleaned:
             return
-        vector = self.model.encode([label])[0]
-        self.index.add(np.array([vector]))
-        self.labels.append(label)
-        self.label_to_vector[label] = vector
-        self._save_labels()
-        faiss.write_index(self.index, self.index_path)
+        with NodeEmbeddingStore._LOCK:
+            to_add: List[str] = []
+            for label in cleaned:
+                key = label.lower()
+                if key in NodeEmbeddingStore._LABEL_TO_INDEX:
+                    continue
+                to_add.append(label)
+            if not to_add:
+                return
+
+            vectors: Optional[np.ndarray] = None
+            if NodeEmbeddingStore._BACKEND == "embedding" and NodeEmbeddingStore._MODEL_CACHE is not None:
+                vectors = NodeEmbeddingStore._MODEL_CACHE.encode(
+                    to_add,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                )
+
+            for idx, label in enumerate(to_add):
+                key = label.lower()
+                NodeEmbeddingStore._LABEL_TO_INDEX[key] = len(NodeEmbeddingStore._LABELS)
+                NodeEmbeddingStore._LABELS.append(label)
+                if vectors is not None:
+                    vector = vectors[idx]
+                    if NodeEmbeddingStore._VECTORS is None:
+                        NodeEmbeddingStore._VECTORS = vector.reshape(1, -1)
+                    else:
+                        NodeEmbeddingStore._VECTORS = np.vstack([NodeEmbeddingStore._VECTORS, vector])
 
     def suggest_similar(self, label: str, top_k: int = 5) -> List[Tuple[str, float]]:
-        if not self.labels:
+        if not NodeEmbeddingStore._LABELS:
             return []
 
-        query_vector = self.model.encode([label])
-        distances, indices = self.index.search(np.array(query_vector), top_k)
-        suggestions = [(self.labels[i], float(distances[0][j])) for j, i in enumerate(indices[0]) if i < len(self.labels)]
-        return suggestions
+        label_key = label.lower()
+        results: List[Tuple[str, float]] = []
+        if (
+            NodeEmbeddingStore._BACKEND == "embedding"
+            and NodeEmbeddingStore._MODEL_CACHE is not None
+            and NodeEmbeddingStore._VECTORS is not None
+        ):
+            query_vector = NodeEmbeddingStore._MODEL_CACHE.encode(
+                [label],
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            )[0]
+            similarities = NodeEmbeddingStore._VECTORS @ query_vector
+            order = np.argsort(-similarities)
+            for idx in order:
+                candidate_label = NodeEmbeddingStore._LABELS[idx]
+                if candidate_label.lower() == label_key:
+                    continue
+                results.append((candidate_label, float(similarities[idx])))
+                if len(results) >= top_k:
+                    break
+            return results
+
+        scores: List[Tuple[str, float]] = []
+        for candidate_label in NodeEmbeddingStore._LABELS:
+            if candidate_label.lower() == label_key:
+                continue
+            score = fuzz.token_set_ratio(label, candidate_label) / 100.0
+            if score > 0:
+                scores.append((candidate_label, float(score)))
+        scores.sort(key=lambda item: item[1], reverse=True)
+        return scores[:top_k]
+
+    def bootstrap_from_session(self, session: Session) -> None:
+        labels = [node.label for node in session.exec(select(models.Node)) if node.label]
+        self.bulk_add(labels)
+
+    def query(self, text: str, top_k: int = 8) -> List[Tuple[str, float]]:
+        if not NodeEmbeddingStore._LABELS:
+            return []
+
+        if (
+            NodeEmbeddingStore._BACKEND == "embedding"
+            and NodeEmbeddingStore._MODEL_CACHE is not None
+            and NodeEmbeddingStore._VECTORS is not None
+        ):
+            query_vector = NodeEmbeddingStore._MODEL_CACHE.encode(
+                [text],
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            )[0]
+            similarities = NodeEmbeddingStore._VECTORS @ query_vector
+            order = np.argsort(-similarities)
+            results: List[Tuple[str, float]] = []
+            for idx in order[:top_k * 2]:
+                candidate_label = NodeEmbeddingStore._LABELS[idx]
+                score = float(similarities[idx])
+                results.append((candidate_label, score))
+            return sorted(results, key=lambda item: item[1], reverse=True)[:top_k]
+
+        scores: List[Tuple[str, float]] = []
+        for candidate_label in NodeEmbeddingStore._LABELS:
+            score = fuzz.token_set_ratio(text, candidate_label) / 100.0
+            if score > 0:
+                scores.append((candidate_label, float(score)))
+        scores.sort(key=lambda item: item[1], reverse=True)
+        return scores[:top_k]

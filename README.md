@@ -10,7 +10,8 @@ MVP Streamlit application for building a Gemma-assisted knowledge graph from loc
 - Admin tab lets SMEs curate canonical terms/aliases and delete ingested documents along with associated graph knowledge.
 - Review queue lets the SME accept/reject/edit triples. Approved triples immediately create graph nodes/edges and provenance links back to their source chunks and SME actions.
 - Graph visualization tab (NetworkX + PyVis) with document-based filters and hover tooltips showing provenance context.
-- Natural-language query tab with chat-style interface. Until the Gemma query planner is integrated, it performs keyword-based graph lookups and returns supporting triples with citations.
+- Natural-language query tab with chat-style interface. An LLM orchestrates retrieval→plan→execution→answer, falling back to keyword search when the model lacks evidence and always returning the supporting triples with citations, node attributes, and tags.
+- Adaptive ontology suggestions cluster similar nodes, call an LLM for rationale, and log guardrails so SMEs can approve inferred parent concepts with provenance retained.
 - SQLite persistence using SQLModel keeps everything portable; no external services required.
 
 ## Getting Started

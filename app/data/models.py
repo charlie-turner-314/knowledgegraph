@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 from typing import List, Optional
 
-from sqlalchemy import CheckConstraint, Column
+from sqlalchemy import CheckConstraint, Column, UniqueConstraint
 from sqlalchemy.dialects.sqlite import JSON as SQLiteJSON
 from sqlmodel import Field, Relationship, SQLModel
 
@@ -28,6 +28,19 @@ class SMEActionType(str, enum.Enum):
     edit_triple = "edit_triple"
     add_node_alias = "add_node_alias"
     system = "system"
+
+
+class NodeAttributeType(str, enum.Enum):
+    string = "string"
+    number = "number"
+    boolean = "boolean"
+    enum = "enum"
+
+
+class OntologySuggestionStatus(str, enum.Enum):
+    pending = "pending"
+    applied = "applied"
+    rejected = "rejected"
 
 
 # --- Core domain tables ------------------------------------------------------------
@@ -96,6 +109,10 @@ class Node(SQLModel, table=True):
         back_populates="object",
         sa_relationship_kwargs={"foreign_keys": "Edge.object_node_id"},
     )
+    attributes: List["NodeAttribute"] = Relationship(
+        back_populates="node",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
 
 
 class CandidateTriple(SQLModel, table=True):
@@ -140,6 +157,10 @@ class Edge(SQLModel, table=True):
     object: Optional[Node] = Relationship(back_populates="incoming_edges", sa_relationship_kwargs={"foreign_keys": "Edge.object_node_id"})
     candidate: Optional[CandidateTriple] = Relationship()
     sources: List["EdgeSource"] = Relationship(back_populates="edge", sa_relationship_kwargs={"cascade": "all, delete-orphan"})
+    tags: List["EdgeTag"] = Relationship(
+        back_populates="edge",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
 
 
 class EdgeSource(SQLModel, table=True):
@@ -176,6 +197,66 @@ class SMEAction(SQLModel, table=True):
 
     candidate: Optional[CandidateTriple] = Relationship(back_populates="actions")
     edge_sources: List["EdgeSource"] = Relationship(back_populates="sme_action")
+
+
+class NodeAttribute(SQLModel, table=True):
+    __tablename__ = "node_attributes"
+    __table_args__ = (
+        CheckConstraint(
+            "value_number IS NOT NULL OR value_text IS NOT NULL OR value_boolean IS NOT NULL",
+            name="node_attribute_value_not_null",
+        ),
+        CheckConstraint(
+            "data_type IN ('string','number','boolean','enum')",
+            name="node_attribute_valid_type",
+        ),
+        UniqueConstraint("node_id", "name", name="uq_node_attribute_node_name"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    node_id: int = Field(foreign_key="nodes.id", nullable=False, index=True)
+    name: str = Field(nullable=False, index=True)
+    data_type: NodeAttributeType = Field(default=NodeAttributeType.string, nullable=False)
+    value_text: Optional[str] = Field(default=None)
+    value_number: Optional[float] = Field(default=None)
+    value_boolean: Optional[bool] = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+
+    node: Optional[Node] = Relationship(back_populates="attributes")
+
+
+class EdgeTag(SQLModel, table=True):
+    __tablename__ = "edge_tags"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    edge_id: int = Field(foreign_key="edges.id", nullable=False, index=True)
+    label: str = Field(nullable=False, index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+
+    edge: Optional[Edge] = Relationship(back_populates="tags")
+
+
+class OntologySuggestion(SQLModel, table=True):
+    __tablename__ = "ontology_suggestions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    parent_label: str = Field(nullable=False, index=True)
+    parent_description: Optional[str] = Field(default=None)
+    predicate: str = Field(default="is_a", nullable=False, index=True)
+    supporting_node_ids: List[int] = Field(default_factory=list, sa_column=Column(SQLiteJSON))
+    supporting_node_labels: List[str] = Field(default_factory=list, sa_column=Column(SQLiteJSON))
+    evidence: dict = Field(default_factory=dict, sa_column=Column(SQLiteJSON))
+    llm_rationale: Optional[str] = Field(default=None)
+    guardrail_flags: List[str] = Field(default_factory=list, sa_column=Column(SQLiteJSON))
+    confidence: float = Field(default=0.0)
+    llm_confidence: Optional[float] = Field(default=None)
+    status: OntologySuggestionStatus = Field(default=OntologySuggestionStatus.pending, nullable=False)
+    applied_parent_node_id: Optional[int] = Field(foreign_key="nodes.id", default=None)
+    raw_llm_response: Optional[str] = Field(default=None)
+    created_by: Optional[str] = Field(default="ontology_inference")
+    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
 
 # --- Helper data classes -----------------------------------------------------------

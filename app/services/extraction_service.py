@@ -50,6 +50,8 @@ class ExtractionOrchestrator:
         self.llm_client = llm_client or get_client()
         self._canonical_context_cache: Optional[List[dict]] = None
         self.embedding_store = NodeEmbeddingStore()
+        if not self.embedding_store.has_entries():
+            self.embedding_store.bootstrap_from_session(session)
 
     def ingest_file(self, path: Path) -> IngestionResult:
         parsed = parse_document(path)
