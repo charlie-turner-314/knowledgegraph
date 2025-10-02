@@ -15,6 +15,7 @@ class AppSettings(BaseSettings):
     database_path: Path = Field(default_factory=lambda: Path.cwd() / "data" / "knowledge_graph.db")
     gemma_endpoint: Optional[str] = Field(default=None, alias="GEMMA_ENDPOINT")
     gemma_api_key: Optional[str] = Field(default=None, alias="GEMMA_API_KEY")
+    model_source: str = Field(default="openai", alias="MODEL_SOURCE")
     log_level: str = Field(default="INFO")
 
     model_config = {

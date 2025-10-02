@@ -16,7 +16,7 @@ from .schemas import ExtractionResponse
 logger = logging.getLogger(__name__)
 
 PROMPT_PATH = (
-    Path(__file__).resolve().parents[1] / "resources" / "prompts" / "extraction_system_prompt.txt"
+    Path(__file__).resolve().parents[2] / "resources" / "prompts" / "extraction_system_prompt.txt"
 )
 
 
@@ -37,10 +37,15 @@ class GemmaClient:
 
     @retry(wait=wait_random_exponential(multiplier=1, max=10), stop=stop_after_attempt(3))
     def _call_api(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if self.endpoint is None:
+            logger.error("Endpoint is none - not calling api endpoint")
+            return {}
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["api-key"] = f"{self.api_key}"
         response = requests.post(self.endpoint, headers=headers, data=orjson.dumps(payload))
+        print(response.status_code)
         response.raise_for_status()
         return response.json()
 
@@ -98,12 +103,13 @@ class GemmaClient:
         )
 
         payload = {
-            "model": "gemma-3-27b-instruct",  # placeholder
             "messages": messages,
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
         }
-        if metadata:
+        if metadata and not settings.model_source == "azure":
+            # Convert all metadata values to strings
+            metadata = {k: str(v) for k, v in metadata.items()}
             payload["metadata"] = metadata
 
         try:

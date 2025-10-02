@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import os
+import faiss
+import numpy as np
+from typing import List, Tuple
 from datetime import datetime
 from typing import Iterable, List, Optional, Sequence
 
+from sentence_transformers import SentenceTransformer
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, func, select
 
@@ -234,7 +239,7 @@ class CandidateRepository:
             .join(models.DocumentChunk, models.CandidateTriple.chunk_id == models.DocumentChunk.id)
             .where(models.DocumentChunk.document_id == document_id)
         )
-        return self.session.exec(statement).one()[0]
+        return self.session.exec(statement).one()
 
     def find_similar(
         self,
@@ -342,7 +347,28 @@ class GraphRepository:
             .join(models.DocumentChunk)
             .where(models.DocumentChunk.document_id == document_id)
         )
-        return self.session.exec(statement).one()[0]
+        return self.session.exec(statement).one()
+    
+    def audit_ontology(self) -> dict:
+        all_nodes = list(self.session.exec(select(models.Node)))
+        isa_edges = list(self.session.exec(select(models.Edge).where(models.Edge.predicate == 'is_a')))
+        isa_subject_ids = {edge.subject_node_id for edge in isa_edges}
+
+        # Heuristic: nodes that are likely instances but lack class membership
+        candidate_untyped = [
+            node for node in all_nodes
+            if node.entity_type in {"equipment", "material", "concept"} and node.id not in isa_subject_ids
+        ]
+
+        # Predicate normalization suggestions
+        all_predicates = {edge.predicate for edge in self.session.exec(select(models.Edge))}
+        ambiguous_predicates = [p for p in all_predicates if p in {"is one of", "belongs to", "type of"}]
+
+        return {
+            "candidate_untyped_nodes": candidate_untyped,
+            "ambiguous_predicates": ambiguous_predicates,
+        }
+
 
 
 class SMEActionRepository:
@@ -366,3 +392,49 @@ class SMEActionRepository:
         self.session.add(action)
         self.session.flush()
         return action
+
+
+class NodeEmbeddingStore:
+    def __init__(self, index_path: str = "node_index.faiss", embedding_model: str = "all-MiniLM-L6-v2"):
+        self.index_path = index_path
+        self.model = SentenceTransformer(embedding_model)
+        self.index = None
+        self.labels = []
+        self.label_to_vector = {}
+
+        if os.path.exists(index_path):
+            self.index = faiss.read_index(index_path)
+            self._load_labels()
+        else:
+            self.index = faiss.IndexFlatL2(self.model.get_sentence_embedding_dimension())
+
+    def _load_labels(self):
+        labels_path = self.index_path + ".labels"
+        if os.path.exists(labels_path):
+            with open(labels_path, "r", encoding="utf-8") as f:
+                self.labels = [line.strip() for line in f.readlines()]
+
+    def _save_labels(self):
+        labels_path = self.index_path + ".labels"
+        with open(labels_path, "w", encoding="utf-8") as f:
+            for label in self.labels:
+                f.write(label + "\n")
+
+    def add_node(self, label: str):
+        if label in self.labels:
+            return
+        vector = self.model.encode([label])[0]
+        self.index.add(np.array([vector]))
+        self.labels.append(label)
+        self.label_to_vector[label] = vector
+        self._save_labels()
+        faiss.write_index(self.index, self.index_path)
+
+    def suggest_similar(self, label: str, top_k: int = 5) -> List[Tuple[str, float]]:
+        if not self.labels:
+            return []
+
+        query_vector = self.model.encode([label])
+        distances, indices = self.index.search(np.array(query_vector), top_k)
+        suggestions = [(self.labels[i], float(distances[0][j])) for j, i in enumerate(indices[0]) if i < len(self.labels)]
+        return suggestions

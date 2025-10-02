@@ -13,6 +13,7 @@ from app.data.repositories import (
     CandidateRepository,
     CanonicalTermRepository,
     DocumentRepository,
+    NodeEmbeddingStore
 )
 from app.ingestion.parsers import parse_document
 from app.ingestion.types import ChunkPayload, ParsedDocument
@@ -48,6 +49,7 @@ class ExtractionOrchestrator:
         self.canonicals = CanonicalTermRepository(session)
         self.llm_client = llm_client or get_client()
         self._canonical_context_cache: Optional[List[dict]] = None
+        self.embedding_store = NodeEmbeddingStore()
 
     def ingest_file(self, path: Path) -> IngestionResult:
         parsed = parse_document(path)
@@ -140,12 +142,23 @@ class ExtractionOrchestrator:
                     obj=key[2],
                 )
                 is_duplicate = duplicate_of is not None or key in seen_triples
+                if is_duplicate:
+                    logger.info(f"Skipping duplicate triple: {key}")
+                    continue
+
+                # Check similarity to exising
+                similar_subjects = self.embedding_store.suggest_similar(key[0])
+                similar_objects = self.embedding_store.suggest_similar(key[2])
+
+
                 candidate = self._build_candidate(
                     chunk,
                     triple,
                     response,
                     duplicate_of=duplicate_of,
                     is_duplicate=is_duplicate,
+                    similar_objects=similar_objects,
+                    similar_subjects=similar_subjects
                 )
                 self.session.add(candidate)
                 candidates.append(candidate)
@@ -182,6 +195,8 @@ class ExtractionOrchestrator:
         *,
         duplicate_of: Optional[models.CandidateTriple],
         is_duplicate: bool,
+        similar_subjects: list[tuple[str, float]],
+        similar_objects: list[tuple[str, float]]
     ) -> models.CandidateTriple:
         suggested_subject = None
         suggested_object = None
