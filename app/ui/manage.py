@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
 from app.data.db import session_scope
-from app.services import AdminService, GraphInsightService
+from app.data.models import NodeAttributeType, StatementStatus
+from app.services import AdminService, GraphInsightService, StatementService
 
 
 def render() -> None:
@@ -18,6 +19,9 @@ def render() -> None:
 
     st.subheader("Graph Maintenance")
     _render_graph_scan_section()
+
+    st.subheader("Evidence Gaps")
+    _render_evidence_gap_section()
 
     st.subheader("Documents")
     _render_documents_section()
@@ -169,8 +173,41 @@ def _render_graph_scan_section() -> None:
             missing_pairs = item.get("missing_pairs") or []
             if missing_pairs:
                 st.write("**Unconnected pairs**")
-                for source, target in missing_pairs:
+                for pair_idx, (source, target) in enumerate(missing_pairs, start=1):
                     st.write(f"- {source} ↔ {target}")
+                    pred_key = f"scan_pred_{idx}_{pair_idx}"
+                    rationale_key = f"scan_rat_{idx}_{pair_idx}"
+                    cols_pair = st.columns([0.4, 0.4, 0.2])
+                    predicate_value = cols_pair[0].text_input(
+                        "Predicate",
+                        key=pred_key,
+                        value="related_to",
+                        help="Relationship to flag as missing evidence.",
+                    )
+                    rationale_value = cols_pair[1].text_input(
+                        "Rationale (optional)",
+                        key=rationale_key,
+                        placeholder="Why is this connection needed?",
+                    )
+                    if cols_pair[2].button(
+                        "Flag needs evidence",
+                        key=f"scan_placeholder_btn_{idx}_{pair_idx}",
+                    ):
+                        predicate_clean = predicate_value.strip() or "related_to"
+                        rationale_clean = rationale_value.strip() or None
+                        with session_scope() as session:
+                            service = GraphInsightService(session)
+                            service.create_placeholder_statement(
+                                subject_label=source,
+                                predicate=predicate_clean,
+                                object_label=target,
+                                rationale=rationale_clean,
+                                created_by="admin-scan",
+                            )
+                        st.session_state[message_key] = (
+                            f"Recorded needs-evidence statement for {source} → {predicate_clean} → {target}."
+                        )
+                        st.rerun()
 
             proposed_nodes = item.get("proposed_nodes") or []
             proposed_edges = item.get("proposed_edges") or []
@@ -181,14 +218,116 @@ def _render_graph_scan_section() -> None:
                     st.write(f"- {node.get('label')} — {description}")
             if proposed_edges:
                 st.write("**LLM proposed edges**")
-                for edge in proposed_edges:
+                for edge_idx, edge in enumerate(proposed_edges, start=1):
                     rationale = edge.get("rationale") or ""
                     st.write(
                         f"- {edge.get('subject')} — {edge.get('predicate')} — {edge.get('object')}"
                         + (f" ({rationale})" if rationale else "")
                     )
+                    if st.button(
+                        "Add as needs-evidence statement",
+                        key=f"scan_proposed_placeholder_{idx}_{edge_idx}",
+                    ):
+                        with session_scope() as session:
+                            service = GraphInsightService(session)
+                            service.create_placeholder_statement(
+                                subject_label=edge.get("subject"),
+                                predicate=edge.get("predicate") or "related_to",
+                                object_label=edge.get("object"),
+                                rationale=rationale or None,
+                                confidence=None,
+                                created_by="admin-scan",
+                            )
+                        st.session_state[message_key] = (
+                            f"Recorded needs-evidence statement for {edge.get('subject')} → {edge.get('predicate')} → {edge.get('object')}."
+                        )
+                        st.rerun()
             if item.get("notes"):
                 st.info(item["notes"])
+
+
+def _render_evidence_gap_section() -> None:
+    """List statements marked as needing evidence and allow resolution."""
+
+    with session_scope() as session:
+        service = StatementService(session)
+        statements = service.list_needs_evidence(limit=100)
+
+    if not statements:
+        st.caption("All statements are currently resolved.")
+        return
+
+    for statement in statements:
+        subject = statement.subject or "(unknown)"
+        obj = statement.object or "(unknown)"
+        header = f"{subject} — {statement.predicate} — {obj}"
+        with st.expander(header, expanded=False):
+            st.write(f"**Status**: {statement.status.value}")
+            if statement.rationale:
+                st.write(f"**Rationale**: {statement.rationale}")
+            if statement.created_by:
+                st.write(f"**Created by**: {statement.created_by}")
+            if statement.resolution_notes:
+                st.write(f"**Previous notes**: {statement.resolution_notes}")
+
+            default_confidence = statement.confidence or 0.0
+            confidence = st.slider(
+                "Updated confidence",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(default_confidence),
+                step=0.05,
+                key=f"evidence_conf_{statement.id}",
+            )
+            notes = st.text_area(
+                "Resolution notes",
+                key=f"evidence_notes_{statement.id}",
+                value=statement.resolution_notes or "",
+            )
+            cols = st.columns(2)
+            if cols[0].button(
+                "Mark validated",
+                key=f"evidence_validate_{statement.id}",
+            ):
+                _update_statement_status(
+                    statement_id=statement.id,
+                    new_status=StatementStatus.validated,
+                    notes=notes.strip() or None,
+                    confidence=confidence,
+                )
+            if cols[1].button(
+                "Mark rejected",
+                key=f"evidence_reject_{statement.id}",
+            ):
+                _update_statement_status(
+                    statement_id=statement.id,
+                    new_status=StatementStatus.rejected,
+                    notes=notes.strip() or None,
+                    confidence=confidence,
+                )
+
+
+def _update_statement_status(
+    *,
+    statement_id: int,
+    new_status: StatementStatus,
+    notes: Optional[str],
+    confidence: Optional[float],
+) -> None:
+    with session_scope() as session:
+        service = StatementService(session)
+        service.resolve_statement(
+            statement_id,
+            new_status=new_status,
+            resolution_notes=notes,
+            confidence=confidence,
+            actor="admin",
+        )
+    st.session_state["admin_flash"] = {
+        "type": "success",
+        "message": "Statement status updated.",
+    }
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------

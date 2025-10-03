@@ -37,6 +37,13 @@ class NodeAttributeType(str, enum.Enum):
     enum = "enum"
 
 
+class StatementStatus(str, enum.Enum):
+    draft = "draft"
+    needs_evidence = "needs_evidence"
+    validated = "validated"
+    rejected = "rejected"
+
+
 class OntologySuggestionStatus(str, enum.Enum):
     pending = "pending"
     applied = "applied"
@@ -164,6 +171,7 @@ class Edge(SQLModel, table=True):
         back_populates="edge",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
+    statements: List["GraphStatement"] = Relationship(back_populates="edge")
 
 
 class EdgeSource(SQLModel, table=True):
@@ -200,6 +208,30 @@ class SMEAction(SQLModel, table=True):
 
     candidate: Optional[CandidateTriple] = Relationship(back_populates="actions")
     edge_sources: List["EdgeSource"] = Relationship(back_populates="sme_action")
+
+
+class GraphStatement(SQLModel, table=True):
+    __tablename__ = "graph_statements"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    subject_node_id: Optional[int] = Field(foreign_key="nodes.id", index=True)
+    predicate: str = Field(nullable=False, index=True)
+    object_node_id: Optional[int] = Field(foreign_key="nodes.id", index=True)
+    edge_id: Optional[int] = Field(foreign_key="edges.id", index=True, default=None)
+    candidate_id: Optional[int] = Field(foreign_key="candidate_triples.id", index=True, default=None)
+    status: StatementStatus = Field(default=StatementStatus.draft, nullable=False, index=True)
+    confidence: Optional[float] = Field(default=None)
+    needs_evidence: bool = Field(default=False, nullable=False)
+    rationale: Optional[str] = Field(default=None)
+    resolution_notes: Optional[str] = Field(default=None)
+    created_by: Optional[str] = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+
+    subject: Optional[Node] = Relationship(sa_relationship_kwargs={"foreign_keys": "GraphStatement.subject_node_id"})
+    object: Optional[Node] = Relationship(sa_relationship_kwargs={"foreign_keys": "GraphStatement.object_node_id"})
+    edge: Optional[Edge] = Relationship(back_populates="statements")
+    candidate: Optional[CandidateTriple] = Relationship()
 
 
 class NodeAttribute(SQLModel, table=True):

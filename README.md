@@ -8,11 +8,13 @@ MVP Streamlit application for building an LLM-assisted knowledge graph from loca
 - Configurable LLM extraction endpoint (stubbed by default) produces candidate subject–predicate–object triples per chunk, preserving the raw LLM response for audit.
 - All LLM prompts live under `resources/prompts/` so SMEs can audit or adjust instructions (e.g., canonical terminology enforcement).
 - Admin tab lets SMEs curate canonical terms/aliases and delete ingested documents along with associated graph knowledge.
-- Review queue lets the SME accept/reject/edit triples. Approved triples immediately create graph nodes/edges and provenance links back to their source chunks and SME actions.
+- Review queue now hosts a conversational assistant that summarizes extracted knowledge, captures SME clarifications, and commits updates (or flags “needs evidence”) when both sides agree.
 - Graph visualization tab (NetworkX + PyVis) with document-based filters and hover tooltips showing provenance context.
 - Natural-language query tab with chat-style interface. An LLM orchestrates retrieval→plan→execution→answer, falling back to keyword search when the model lacks evidence and always returning the supporting triples with citations, node attributes, and tags.
 - Adaptive ontology suggestions cluster similar nodes, call an LLM for rationale, and log guardrails so SMEs can approve inferred parent concepts with provenance retained.
 - Graph maintenance tools can scan for unconnected but semantically similar clusters and request LLM-backed recommendations for bridging nodes or edges.
+- Knowledge statements persist every assertion with validation status, confidence, and “needs evidence” flags so SMEs can resolve gaps iteratively.
+- Evidence gap dashboard surfaces statements flagged as needing SME input and lets reviewers resolve or reject them with contextual notes.
 - SQLite persistence using SQLModel keeps everything portable; no external services required.
 
 ## Documentation
@@ -68,104 +70,67 @@ streamlit_app.py   # Streamlit entrypoint
 - Harden provenance audit by exposing SME action logs and LLM prompt/response inspection from the UI.
 
 ## User Stories
-User Story Description: 
 
-As a Validation Lead on the TAD platform, I require the LLP to systematically extract and structure validation-critical information from innovation proposals and SME inputs to efficiently link technical claims with traceable facts. This enables assessment of each innovation’s readiness, operational fit, and strategic alignment for deep underground mining applications.  
+### Validation Lead
 
- 
+**Goal**: Systematically extract and structure validation-critical information from innovation proposals and SME inputs to link technical claims with traceable facts. This supports assessment of readiness, operational fit, and strategic alignment for deep underground mining.
 
-Acceptance Criteria: 
+**Acceptance Criteria**
 
-Agent ingests innovation context including scope, maturity, constraints, and technical documentation. 
+- Agent ingests innovation context including scope, maturity, constraints, and technical documentation.
+- Agent scans all client documents and SME inputs to extract information across 12 readiness domains:
+  - Ventilation & Radon Control
+  - Cooling Systems
+  - Rock Breaking, Sorting & Hauling
+  - TRL & Prior Testing
+  - Autonomy Readiness
+  - Production & Development Cycle Fit
+  - Safety & Emergency Systems
+  - Infrastructure Integration
+  - Maintainability & Survivability
+  - Sustainability & Energy Efficiency
+  - Human Factors & Operational Fit
+  - Known / Potential Failure Modes
 
-Agent scans all client documents and SME inputs to extract information across 12 readiness domains: 
+**Workflow Overview**
 
-Ventilation & Radon Control 
+1. SMEs and mining engineers provide trial data, innovation proposals, and operational knowledge.
+2. SMEs upload proposals, technical specifications, trial reports, and supporting materials directly to the system.
+3. Agent parses and extracts validation-critical information across domains.
+4. Agent identifies relationships between technical concepts, constraints, and innovation goals (e.g., cooling systems vs. depth/power infrastructure).
+5. Agent detects missing, vague, or contradictory information and generates targeted, domain-specific questions.
+6. Agent engages SMEs with non-redundant queries to clarify assumptions and close gaps.
+7. Agent captures SME responses and updates the innovation’s readiness profile in real time.
+8. Agent constructs a knowledge web that organises facts, dependencies, and validation logic in a traceable format.
 
-Cooling Systems 
+**Success Criteria**
 
-Rock Breaking, Sorting & Hauling 
+- All validation domains are populated with structured, accurate data.
+- SME queries are relevant and resolved efficiently.
+- The knowledge web reflects a coherent, traceable understanding.
 
-TRL & Prior Testing 
+### Project Manager / Initiative Owner
 
-Autonomy Readiness 
+**Goal**: Receive structured outputs to plan trials, allocate resources, and communicate scope to stakeholders.
 
-Production & Development Cycle Fit 
+- Automatically generate documentation based on extracted and clarified information.
 
-Safety & Emergency Systems 
+**Success Criteria**
 
-Infrastructure Integration 
+- Documents are complete, accurate, and properly formatted.
+- Outputs align with TAD’s validation framework.
 
-Maintainability & Survivability 
+### Management / Executive Stakeholders
 
-Sustainability & Energy Efficiency 
+**Goal**: Obtain high-level insights and real-time support during strategic reviews and investment decisions.
 
-Human Factors & Operational Fit 
+- Provide chatbot-style interaction during meetings to answer questions, clarify technical details, and surface readiness blockers.
+- Translate complex technical data into concise, decision-ready summaries.
+- Capture live SME feedback and update readiness profiles dynamically.
+- Support scenario-based queries (e.g., “What happens if we deploy this at 1.8 km depth?”).
 
-Known/Potential Failure Modes 
+**Success Metrics**
 
- 
-
-Workflow overview: 
-
- SME / Mining engineer collaboration  
-
-SMEs and mining engineers are the primary source of technical truth. They provide trial data, innovation proposals, and operational knowledge that the LLP must interpret and validate 
-
-SMEs upload innovation proposals, technical specifications, trials reports and supporting materials directly to the LLP system  
-
-Parse and extract validation-critical information across domains like ventilation, cooling, autonomy, and safety. 
-
-Identify relationships between technical concepts, constraints, and innovation goals (e.g. how cooling systems relate to depth and power infrastructure). 
-
-Detect missing, vague, or contradictory information and generate targeted, domain-specific questions. 
-
-Engage SMEs with intelligent, non-redundant queries to clarify assumptions and close gaps. 
-
-Capture SME responses and update the innovation’s readiness profile in real time. 
-
-Construct a “knowledge web” that organizes facts, dependencies, and validation logic in a traceable format. 
-
-Success criteria: 
-
-All validation domains are populated with structured, accurate data  
-
-SME queries are relevant and resolved efficiently 
-
-The knowledge web reflects a coherent traceable understanding  
-
- 
-
-Project Manager / initiative owner  
-
-PMs and initiative owners need structured outputs to plan trials, allocate resources and communicate scope to stakeholders  
-
-Automatically generate documentation based on extracted and clarified information 
-
-Success criteria: 
-
-Documents are complete, accurate and formatted  
-
-Outputs align with TAD’s validation framework 
-
- 
-
-Management / Executive Stakeholders  
-
-Executives require high-level insights and real-time support during strategic reviews and investment decisions  
-
- Provide chatbot-style interaction during meetings to answer questions, clarify technical details, and surface readiness blockers. 
-
-Translate complex technical data into concise, decision-ready summaries. 
-
-Capture live SME feedback and update readiness profiles dynamically. 
-
-Support scenario-based queries (e.g. “What happens if we deploy this at 1.8km depth?”). 
-
-Success metrics 
-
-Executives receive clear, contextual answers  
-
-Real-time updates reflect the most current SME input and validation status. 
-
-Executives invest in the product  
+- Executives receive clear, contextual answers.
+- Real-time updates reflect the most current SME input and validation status.
+- Executives have confidence to invest in the product.

@@ -43,6 +43,12 @@ QUERY_ANSWER_PROMPT_PATH = (
 CONNECTION_RECOMMENDATION_PROMPT_PATH = (
     Path(__file__).resolve().parents[2] / "resources" / "prompts" / "connection_recommendation_prompt.txt"
 )
+CANDIDATE_VALIDATION_PROMPT_PATH = (
+    Path(__file__).resolve().parents[2] / "resources" / "prompts" / "candidate_validation_prompt.txt"
+)
+REVIEW_SUMMARY_PROMPT_PATH = (
+    Path(__file__).resolve().parents[2] / "resources" / "prompts" / "review_summary_prompt.txt"
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -112,6 +118,30 @@ def _load_connection_recommendation_prompt() -> str:
             CONNECTION_RECOMMENDATION_PROMPT_PATH,
         )
         return "Assess whether new nodes or edges are needed. Return empty lists when no changes are required."
+
+
+@functools.lru_cache(maxsize=1)
+def _load_candidate_validation_prompt() -> str:
+    try:
+        return CANDIDATE_VALIDATION_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.warning(
+            "Candidate validation prompt file %s missing; using fallback text",
+            CANDIDATE_VALIDATION_PROMPT_PATH,
+        )
+        return "Ask a clarifying question about the candidate triple."
+
+
+@functools.lru_cache(maxsize=1)
+def _load_review_summary_prompt() -> str:
+    try:
+        return REVIEW_SUMMARY_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.warning(
+            "Review summary prompt file %s missing; using fallback text",
+            REVIEW_SUMMARY_PROMPT_PATH,
+        )
+        return "Summarize the candidate information and ask for clarifications if needed."
 
 
 class LLMClient:
@@ -492,6 +522,72 @@ class LLMClient:
                 "raw_response": raw,
             }
         )
+
+    def generate_validation_question(
+        self,
+        *,
+        candidate_payload: Dict[str, Any],
+        history: List[Dict[str, str]],
+    ) -> str:
+        if self._dry_run:
+            return "Could you please confirm the key evidence supporting this relationship?"
+
+        system_prompt = _load_candidate_validation_prompt()
+        payload = {
+            "candidate": candidate_payload,
+            "history": history,
+        }
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": orjson.dumps(payload).decode(),
+            },
+        ]
+        request_payload = {
+            "messages": messages,
+            "temperature": settings.llm_temperature_answer,
+        }
+        raw = self._call_api(request_payload)
+        message_content = raw.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if isinstance(message_content, str):
+            return message_content.strip()
+        if isinstance(message_content, dict):
+            return orjson.dumps(message_content).decode()
+        return "Please provide additional evidence."
+
+    def generate_review_summary(
+        self,
+        *,
+        candidates: List[Dict[str, Any]],
+        history: List[Dict[str, str]],
+    ) -> str:
+        if self._dry_run:
+            return "Here is what I've gathered so far..."
+
+        system_prompt = _load_review_summary_prompt()
+        payload = {
+            "candidates": candidates,
+            "history": history,
+        }
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": orjson.dumps(payload).decode(),
+            },
+        ]
+        request_payload = {
+            "messages": messages,
+            "temperature": settings.llm_temperature_answer,
+        }
+        raw = self._call_api(request_payload)
+        message_content = raw.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if isinstance(message_content, str):
+            return message_content.strip()
+        if isinstance(message_content, dict):
+            return orjson.dumps(message_content).decode()
+        return "I’m ready when you are to confirm or provide corrections."
 
 
 def get_client() -> LLMClient:

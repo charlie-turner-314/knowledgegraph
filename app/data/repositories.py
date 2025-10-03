@@ -15,6 +15,7 @@ from sqlmodel import Session, func, select
 from app.core.config import settings
 
 from . import models
+from .models import StatementStatus
 
 
 logger = logging.getLogger(__name__)
@@ -395,6 +396,9 @@ class GraphRepository:
         object_attributes: Optional[Sequence[Dict[str, object]]] = None,
         tags: Optional[Sequence[str]] = None,
         created_by: Optional[str] = None,
+        statement_rationale: Optional[str] = None,
+        statement_confidence: Optional[float] = None,
+        needs_evidence: bool = False,
     ) -> models.Edge:
         """Persist an edge with provenance, normalising optional attributes and tags."""
         subject_node = self.nodes.ensure_node(
@@ -468,7 +472,70 @@ class GraphRepository:
                     )
                 )
 
+        self._create_statement(
+            subject_node=subject_node,
+            predicate=predicate,
+            object_node=object_node,
+            status=StatementStatus.needs_evidence if needs_evidence else StatementStatus.validated,
+            needs_evidence=needs_evidence,
+            confidence=statement_confidence if statement_confidence is not None else (candidate.llm_confidence if candidate else None),
+            rationale=statement_rationale,
+            edge=edge,
+            candidate=candidate,
+            created_by=created_by,
+        )
+
         return edge
+
+    def create_statement_placeholder(
+        self,
+        *,
+        subject_label: Optional[str],
+        predicate: str,
+        object_label: Optional[str],
+        created_by: Optional[str] = None,
+        rationale: Optional[str] = None,
+        confidence: Optional[float] = None,
+    ) -> models.GraphStatement:
+        """Create a statement flagged as needing evidence without creating an edge."""
+
+        subject_node = (
+            self.nodes.ensure_node(
+                label=subject_label,
+                entity_type=None,
+                canonical_term=None,
+                sme_override=True,
+            )
+            if subject_label
+            else None
+        )
+        object_node = (
+            self.nodes.ensure_node(
+                label=object_label,
+                entity_type=None,
+                canonical_term=None,
+                sme_override=True,
+            )
+            if object_label
+            else None
+        )
+
+        self._embedding_store.bulk_add(
+            [node.label for node in [subject_node, object_node] if node and node.label]
+        )
+
+        return self._create_statement(
+            subject_node=subject_node,
+            predicate=predicate,
+            object_node=object_node,
+            status=StatementStatus.needs_evidence,
+            needs_evidence=True,
+            confidence=confidence,
+            rationale=rationale,
+            edge=None,
+            candidate=None,
+            created_by=created_by,
+        )
 
     def _normalize_attributes(
         self, attributes: Optional[Sequence[Dict[str, object]]]
@@ -555,6 +622,38 @@ class GraphRepository:
             }
 
         return list(normalized.values())
+
+    def _create_statement(
+        self,
+        *,
+        subject_node: Optional[models.Node],
+        predicate: str,
+        object_node: Optional[models.Node],
+        status: StatementStatus,
+        needs_evidence: bool,
+        confidence: Optional[float],
+        rationale: Optional[str],
+        edge: Optional[models.Edge],
+        candidate: Optional[models.CandidateTriple],
+        created_by: Optional[str],
+        resolution_notes: Optional[str] = None,
+    ) -> models.GraphStatement:
+        statement = models.GraphStatement(
+            subject_node_id=subject_node.id if subject_node else None,
+            predicate=predicate,
+            object_node_id=object_node.id if object_node else None,
+            edge_id=edge.id if edge else None,
+            candidate_id=candidate.id if candidate else None,
+            status=status,
+            confidence=confidence,
+            needs_evidence=needs_evidence,
+            rationale=rationale,
+            created_by=created_by,
+            resolution_notes=resolution_notes,
+        )
+        self.session.add(statement)
+        self.session.flush()
+        return statement
 
     def count_edges_for_document(self, document_id: int) -> int:
         """Return the number of distinct edges attributed to ``document_id``."""
@@ -653,6 +752,58 @@ class OntologySuggestionRepository:
             if sorted((candidate.supporting_node_ids or [])) == sorted_ids:
                 return candidate
         return None
+
+
+class StatementRepository:
+    """Persistence helpers for graph statements (knowledge assertions)."""
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get(self, statement_id: int) -> Optional[models.GraphStatement]:
+        return self.session.get(models.GraphStatement, statement_id)
+
+    def list_by_status(
+        self, status: StatementStatus, *, limit: int = 100
+    ) -> List[models.GraphStatement]:
+        statement = (
+            select(models.GraphStatement)
+            .where(models.GraphStatement.status == status)
+            .order_by(models.GraphStatement.updated_at.desc())
+            .limit(limit)
+            .options(
+                selectinload(models.GraphStatement.subject),
+                selectinload(models.GraphStatement.object),
+                selectinload(models.GraphStatement.edge)
+                .selectinload(models.Edge.sources)
+                .selectinload(models.EdgeSource.document_chunk)
+                .selectinload(models.DocumentChunk.document),
+            )
+        )
+        return list(self.session.exec(statement))
+
+    def update_status(
+        self,
+        statement: models.GraphStatement,
+        *,
+        status: StatementStatus,
+        needs_evidence: Optional[bool] = None,
+        confidence: Optional[float] = None,
+        resolution_notes: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> models.GraphStatement:
+        statement.status = status
+        if needs_evidence is not None:
+            statement.needs_evidence = needs_evidence
+        if confidence is not None:
+            statement.confidence = confidence
+        if resolution_notes is not None:
+            statement.resolution_notes = resolution_notes
+        if actor:
+            statement.created_by = actor
+        statement.updated_at = datetime.utcnow()
+        self.session.add(statement)
+        return statement
 
     def create_suggestion(
         self,

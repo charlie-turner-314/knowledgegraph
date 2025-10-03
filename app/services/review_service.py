@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlmodel import Session, select
 from sqlalchemy.orm import selectinload
@@ -28,6 +28,11 @@ class ReviewService:
     def list_pending(self, limit: int = 25) -> List[models.CandidateTriple]:
         """Return the oldest pending candidates up to ``limit``."""
         return self.candidates.list_pending(limit=limit)
+
+    def serialize_pending(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return pending candidates serialised for LLM/context usage."""
+        pending = self.list_pending(limit=limit)
+        return [serialize_candidate(item) for item in pending]
 
     def approve_candidate(
         self,
@@ -107,6 +112,8 @@ class ReviewService:
             object_attributes=object_attrs_payload,
             tags=tags_payload,
             created_by=actor,
+            statement_rationale=notes,
+            statement_confidence=candidate.llm_confidence,
         )
 
         self.candidates.update_status(candidate, status=models.CandidateStatus.approved)
@@ -131,6 +138,57 @@ class ReviewService:
             payload={"reason": reason},
         )
         return self.candidates.update_status(candidate, status=models.CandidateStatus.rejected)
+
+    def flag_candidate_needs_evidence(
+        self,
+        candidate_id: int,
+        *,
+        actor: Optional[str],
+        rationale: Optional[str] = None,
+        confidence: Optional[float] = None,
+    ) -> models.GraphStatement:
+        """Create a needs-evidence statement for the candidate and pause review."""
+
+        candidate = self._load_candidate(candidate_id)
+        statement = self.graph.create_statement_placeholder(
+            subject_label=candidate.subject_text,
+            predicate=candidate.predicate_text,
+            object_label=candidate.object_text,
+            created_by=actor,
+            rationale=rationale,
+            confidence=confidence or candidate.llm_confidence,
+        )
+        self.candidates.update_status(candidate, status=models.CandidateStatus.needs_revision)
+        return statement
+
+    def approve_candidates_bulk(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        actor: Optional[str],
+        summary: Optional[str],
+    ) -> None:
+        for candidate in candidates:
+            payload = {
+                "subject": candidate["subject"],
+                "predicate": candidate["predicate"],
+                "object": candidate["object"],
+                "notes": summary,
+                "subject_attributes": candidate.get("subject_attributes") or [],
+                "object_attributes": candidate.get("object_attributes") or [],
+                "tags": candidate.get("tags") or [],
+            }
+            self.approve_candidate(
+                candidate["id"],
+                actor=actor,
+                subject_override=payload["subject"],
+                predicate_override=payload["predicate"],
+                object_override=payload["object"],
+                notes=summary,
+                subject_attributes=payload["subject_attributes"],
+                object_attributes=payload["object_attributes"],
+                tags=payload["tags"],
+            )
 
     def _load_candidate(self, candidate_id: int) -> models.CandidateTriple:
         """Return a candidate with eager-loaded relations or raise if missing."""

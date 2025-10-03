@@ -163,6 +163,27 @@ class GraphInsightService:
 
         return recommendations
 
+    def create_placeholder_statement(
+        self,
+        *,
+        subject_label: Optional[str],
+        predicate: str,
+        object_label: Optional[str],
+        rationale: Optional[str],
+        created_by: Optional[str] = None,
+        confidence: Optional[float] = None,
+    ) -> models.GraphStatement:
+        """Record a needs-evidence statement anchoring a prospective connection."""
+
+        return self.graph.create_statement_placeholder(
+            subject_label=subject_label,
+            predicate=predicate,
+            object_label=object_label,
+            created_by=created_by,
+            rationale=rationale,
+            confidence=confidence,
+        )
+
     def _load_nodes(self) -> List[models.Node]:
         """Return all nodes with eager-loaded attributes."""
         stmt = select(models.Node).options(selectinload(models.Node.attributes))
