@@ -129,10 +129,14 @@ class LLMClient:
             return {}
         headers = {"Content-Type": "application/json"}
         if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-            headers["api-key"] = f"{self.api_key}"
+            if settings.model_source == "azure":
+                headers["api-key"] = f"{self.api_key}"
+            else:
+                headers["Authorization"] = f"Bearer {self.api_key}"
         response = requests.post(self.endpoint, headers=headers, data=orjson.dumps(payload))
         print(response.status_code)
+        print(response.json())
+        exit()
         response.raise_for_status()
         return response.json()
 
@@ -191,7 +195,7 @@ class LLMClient:
 
         payload = {
             "messages": messages,
-            "temperature": 0.1,
+            "temperature": settings.temperature,
             "response_format": {"type": "json_object"},
         }
         if metadata and not settings.model_source == "azure":
@@ -269,7 +273,7 @@ class LLMClient:
 
         request_payload: Dict[str, Any] = {
             "messages": messages,
-            "temperature": 0.2,
+            "temperature": settings.temperature,
             "response_format": {"type": "json_object"},
         }
 
