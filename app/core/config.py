@@ -4,7 +4,7 @@ import functools
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field
+from pydantic import Field, FieldValidationInfo, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -30,6 +30,28 @@ class AppSettings(BaseSettings):
         "env_file": ".env",
         "case_sensitive": False,
     }
+
+    @field_validator(
+        "llm_temperature_extraction",
+        "llm_temperature_retrieval",
+        "llm_temperature_plan",
+        "llm_temperature_answer",
+        "llm_temperature_connections",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_temperature(cls, value: Optional[str | float], info: FieldValidationInfo) -> float:
+        """Ensure temperature settings are parsed as floats even when defined as env strings."""
+
+        if value is None or value == "":
+            default = cls.model_fields[info.field_name].default  # type: ignore[index]
+            return float(default)
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid temperature value: {value}") from exc
 
     @property
     def database_url(self) -> str:
