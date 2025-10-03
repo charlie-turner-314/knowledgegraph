@@ -195,7 +195,7 @@ class LLMClient:
 
         payload = {
             "messages": messages,
-            "temperature": settings.temperature,
+            "temperature": settings.llm_temperature_extraction,
             "response_format": {"type": "json_object"},
         }
         if metadata and not settings.model_source == "azure":
@@ -328,7 +328,7 @@ class LLMClient:
         ]
         request_payload = {
             "messages": messages,
-            "temperature": 0.0,
+            "temperature": settings.llm_temperature_retrieval,
             "response_format": {"type": "json_object"},
         }
         raw = self._call_api(request_payload)
@@ -390,7 +390,7 @@ class LLMClient:
         ]
         request_payload = {
             "messages": messages,
-            "temperature": 0.0,
+            "temperature": settings.llm_temperature_plan,
             "response_format": {"type": "json_object"},
         }
         raw = self._call_api(request_payload)
@@ -434,7 +434,7 @@ class LLMClient:
         ]
         request_payload = {
             "messages": messages,
-            "temperature": 0.3,
+            "temperature": settings.llm_temperature_answer,
             "response_format": {"type": "json_object"},
         }
         raw = self._call_api(request_payload)
@@ -475,7 +475,7 @@ class LLMClient:
         ]
         request_payload = {
             "messages": messages,
-            "temperature": 0.0,
+            "temperature": settings.llm_temperature_connections,
             "response_format": {"type": "json_object"},
         }
         raw = self._call_api(request_payload)

@@ -20,6 +20,11 @@ class AppSettings(BaseSettings):
     embedding_deployment: Optional[str] = Field(default=None, alias="EMBEDDING_DEPLOYMENT")
     model_source: str = Field(default="openai", alias="MODEL_SOURCE")
     log_level: str = Field(default="INFO")
+    llm_temperature_extraction: float = Field(default=0.1, alias="LLM_TEMPERATURE_EXTRACTION")
+    llm_temperature_retrieval: float = Field(default=0.0, alias="LLM_TEMPERATURE_RETRIEVAL")
+    llm_temperature_plan: float = Field(default=0.0, alias="LLM_TEMPERATURE_PLAN")
+    llm_temperature_answer: float = Field(default=0.3, alias="LLM_TEMPERATURE_ANSWER")
+    llm_temperature_connections: float = Field(default=0.0, alias="LLM_TEMPERATURE_CONNECTIONS")
 
     model_config = {
         "env_file": ".env",

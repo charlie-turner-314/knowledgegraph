@@ -35,6 +35,7 @@ The command writes HTML output to `docs/`, providing a navigable view of reposit
    ```
 2. **(Optional) Configure LLM & embedding endpoints**
    - Copy `.env.example` to `.env` and set `LLM_ENDPOINT`/`LLM_API_KEY` for your chat-completions model. Provide `EMBEDDING_ENDPOINT` (plus optional key/deployment) if you want semantic similarity and clustering. When unset, the app falls back to stubbed extraction and fuzzy similarity.
+   - Adjust `LLM_TEMPERATURE_*` values to match the behaviour expected by your model (e.g., some GPT-5 deployments require `temperature=1`).
 3. **Initialize the database & run Streamlit**
    ```bash
    streamlit run streamlit_app.py
