@@ -10,10 +10,7 @@ def main() -> None:
 
     output_dir = Path("docs")
     output_dir.mkdir(exist_ok=True)
-    context = pdoc.Context()
-    module = pdoc.Module("app", context=context)
-    pdoc.link_inheritance(context)
-    pdoc.pdoc("app", output_directory=str(output_dir))
+    pdoc.pdoc("app", output_directory=output_dir)
 
 
 if __name__ == "__main__":
