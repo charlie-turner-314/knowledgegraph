@@ -12,7 +12,7 @@ from sqlmodel import Session, select
 
 from app.data import models
 from app.data.repositories import NodeEmbeddingStore
-from app.llm.client import GemmaClient, get_client
+from app.llm.client import LLMClient, get_client
 from app.llm.schemas import (
     QueryAnswerResponse,
     QueryPlanResponse,
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class QueryMatch:
+    """Supporting triple returned by the query execution pipeline."""
     edge_id: Optional[int]
     subject: str
     predicate: str
@@ -38,13 +39,17 @@ class QueryMatch:
 
 @dataclass
 class QueryResult:
+    """High-level response for a natural language query."""
     answers: List[str]
     matches: List[QueryMatch]
     note: str | None = None
 
 
 class QueryService:
-    def __init__(self, session: Session, *, llm_client: Optional[GemmaClient] = None):
+    """Natural language query pipeline orchestrating retrieval, planning, and answering."""
+
+    def __init__(self, session: Session, *, llm_client: Optional[LLMClient] = None):
+        """Store repository helpers and configure the embedding cache."""
         self.session = session
         self.llm_client = llm_client or get_client()
         self.embedding_store = NodeEmbeddingStore()
@@ -57,6 +62,7 @@ class QueryService:
         *,
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> QueryResult:
+        """Answer ``question`` using the multi-stage LLM workflow with fallbacks."""
         cleaned = (question or "").strip()
         if not cleaned:
             return QueryResult(
@@ -125,6 +131,7 @@ class QueryService:
     # Pipeline stages
 
     def _build_retrieval_context(self, question: str) -> Dict[str, object]:
+        """Assemble candidate nodes/edges and metadata for LLM retrieval planning."""
         top_nodes = self._rank_nodes(question, top_k=8)
         node_labels = [item[0] for item in top_nodes]
         nodes = self._load_nodes_by_labels(node_labels)
@@ -166,6 +173,7 @@ class QueryService:
         question: str,
         context: Dict[str, object],
     ) -> QueryRetrievalResponse:
+        """Call the LLM to identify focus nodes and predicates."""
         response = self.llm_client.analyze_query(question=question, context=context)
         return response
 
@@ -175,6 +183,7 @@ class QueryService:
         retrieval: QueryRetrievalResponse,
         context: Dict[str, object],
     ) -> QueryPlanResponse:
+        """Ask the LLM to convert retrieval hints into a traversal plan."""
         response = self.llm_client.plan_query(
             question=question,
             retrieval=retrieval,
@@ -187,6 +196,7 @@ class QueryService:
         plan: QueryPlanResponse,
         retrieval: QueryRetrievalResponse,
     ) -> List[QueryMatch]:
+        """Traverse the graph according to ``plan`` and collect supporting triples."""
         if not plan.plan or not plan.plan.steps:
             return []
 
@@ -232,6 +242,7 @@ class QueryService:
         matches: List[QueryMatch],
         retrieval: QueryRetrievalResponse,
     ) -> QueryAnswerResponse | None:
+        """Request an answer summary from the LLM using traversal results."""
         payload = {
             "question": question,
             "plan": plan.model_dump(),
@@ -257,10 +268,12 @@ class QueryService:
     # Helpers
 
     def _rank_nodes(self, text: str, top_k: int) -> List[Tuple[str, float]]:
+        """Use the embedding store to find labels closest to ``text``."""
         suggestions = self.embedding_store.query(text, top_k=top_k)
         return suggestions
 
     def _load_nodes_by_labels(self, labels: Sequence[str]) -> List[models.Node]:
+        """Return nodes whose labels match the supplied list."""
         if not labels:
             return []
         stmt = (
@@ -271,6 +284,7 @@ class QueryService:
         return list(self.session.exec(stmt))
 
     def _load_edges_for_nodes(self, node_ids: Iterable[int], sample_limit: int) -> List[models.Edge]:
+        """Return edges touching ``node_ids`` up to ``sample_limit`` results."""
         node_ids = list(node_ids)
         if not node_ids:
             return []
@@ -292,6 +306,7 @@ class QueryService:
     def _candidate_label_map(
         self, retrieval: QueryRetrievalResponse
     ) -> Dict[str, Set[int]]:
+        """Map lowercase node labels to sets of candidate node IDs from retrieval."""
         mapping: Dict[str, Set[int]] = defaultdict(set)
         if retrieval.focus_nodes:
             for node in retrieval.focus_nodes:
@@ -310,6 +325,7 @@ class QueryService:
         directions: Set[str],
         predicates: Sequence[str],
     ) -> List[models.Edge]:
+        """Fetch edges aligned with traversal ``directions`` and ``predicates``."""
         node_ids = list(node_ids)
         if not node_ids:
             return []
@@ -345,6 +361,7 @@ class QueryService:
         return edges
 
     def _resolve_directions(self, directive: str | None) -> Set[str]:
+        """Normalise a direction string into a set of traversal instructions."""
         directive = (directive or "outbound").lower()
         if directive == "both":
             return {"outbound", "inbound"}
@@ -353,6 +370,7 @@ class QueryService:
         return {"outbound"}
 
     def _to_query_match(self, edge: models.Edge) -> QueryMatch:
+        """Convert an edge ORM object into a ``QueryMatch`` dataclass."""
         source = edge.sources[0] if edge.sources else None
         document = None
         page = None
@@ -376,6 +394,7 @@ class QueryService:
         )
 
     def _keyword_fallback(self, question: str) -> QueryResult:
+        """Perform a simple keyword-based search when the LLM pipeline fails."""
         keywords = {
             word.lower()
             for word in re.findall(r"[A-Za-z0-9]+", question)
@@ -422,6 +441,7 @@ class QueryService:
 
     @staticmethod
     def _notify(callback: Optional[Callable[[str], None]], message: str) -> None:
+        """Send progress updates to the optional callback, ignoring failures."""
         if callback:
             try:
                 callback(message)
@@ -430,6 +450,7 @@ class QueryService:
 
     @staticmethod
     def _attribute_value(attr: Optional[models.NodeAttribute]) -> Optional[object]:
+        """Return the scalar value for ``attr`` regardless of storage columns."""
         if attr is None:
             return None
         if attr.data_type == models.NodeAttributeType.number:
@@ -439,6 +460,7 @@ class QueryService:
         return attr.value_text
 
     def _serialize_node_attributes(self, node: Optional[models.Node]) -> List[Dict[str, object]]:
+        """Serialise node attributes into simple dictionaries for LLM payloads."""
         if node is None or not node.attributes:
             return []
         serialized: List[Dict[str, object]] = []
@@ -453,6 +475,7 @@ class QueryService:
         return serialized
 
     def _node_attribute_map(self, node: Optional[models.Node]) -> Dict[str, object]:
+        """Return a name→value mapping for a node's attributes."""
         if node is None or not node.attributes:
             return {}
         mapping: Dict[str, object] = {}

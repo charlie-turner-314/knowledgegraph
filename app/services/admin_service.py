@@ -17,6 +17,7 @@ from app.data.repositories import (
 
 @dataclass
 class DocumentOverview:
+    """Summary information for documents shown in the admin UI."""
     id: int
     name: str
     media_type: str
@@ -28,6 +29,7 @@ class DocumentOverview:
 
 @dataclass
 class CanonicalTermView:
+    """Lightweight view of canonical vocabulary entries."""
     id: int
     label: str
     entity_type: Optional[str]
@@ -35,7 +37,10 @@ class CanonicalTermView:
 
 
 class AdminService:
+    """Administrative operations for documents and canonical vocabulary."""
+
     def __init__(self, session: Session):
+        """Initialise repository helpers with a shared session."""
         self.session = session
         self.documents = DocumentRepository(session)
         self.candidates = CandidateRepository(session)
@@ -45,6 +50,7 @@ class AdminService:
     # --- Document management -----------------------------------------------------
 
     def list_documents(self) -> List[DocumentOverview]:
+        """Return high-level statistics for each ingested document."""
         docs = self.documents.list_documents()
         overview: List[DocumentOverview] = []
         for doc in docs:
@@ -64,6 +70,7 @@ class AdminService:
         return overview
 
     def delete_document(self, document_id: int) -> None:
+        """Delete the specified document and cascade related graph data."""
         statement = (
             select(models.Document)
             .where(models.Document.id == document_id)
@@ -77,6 +84,7 @@ class AdminService:
     # --- Canonical term management ----------------------------------------------
 
     def list_canonical_terms(self) -> List[CanonicalTermView]:
+        """Return all canonical terms mapped into simple view models."""
         terms = self.canonicals.list_terms()
         return [
             CanonicalTermView(
@@ -95,6 +103,7 @@ class AdminService:
         entity_type: Optional[str],
         aliases: Optional[List[str]] = None,
     ) -> models.CanonicalTerm:
+        """Create a new canonical term and optional aliases."""
         term = self.canonicals.upsert(label=label, entity_type=entity_type)
         if aliases:
             for alias in aliases:
@@ -108,6 +117,7 @@ class AdminService:
         label: Optional[str] = None,
         entity_type: Optional[str] = None,
     ) -> models.CanonicalTerm:
+        """Rename or update metadata for an existing canonical term."""
         term = self.session.get(models.CanonicalTerm, term_id)
         if not term:
             raise ValueError("Canonical term not found")
@@ -119,6 +129,7 @@ class AdminService:
         return term
 
     def add_alias(self, term_id: int, alias: str) -> models.CanonicalTerm:
+        """Append a new alias to ``term_id``."""
         term = self.session.get(models.CanonicalTerm, term_id)
         if not term:
             raise ValueError("Canonical term not found")
@@ -126,6 +137,7 @@ class AdminService:
         return term
 
     def remove_alias(self, term_id: int, alias: str) -> models.CanonicalTerm:
+        """Remove ``alias`` from ``term_id``."""
         term = self.session.get(models.CanonicalTerm, term_id)
         if not term:
             raise ValueError("Canonical term not found")
@@ -133,6 +145,7 @@ class AdminService:
         return term
 
     def delete_canonical_term(self, term_id: int) -> None:
+        """Delete the canonical term identified by ``term_id``."""
         term = self.session.get(models.CanonicalTerm, term_id)
         if not term:
             raise ValueError("Canonical term not found")

@@ -7,14 +7,12 @@ from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import requests
 from rapidfuzz import fuzz
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, func, select
 
-try:  # pragma: no cover - optional dependency
-    from sentence_transformers import SentenceTransformer
-except ImportError:  # pragma: no cover - optional dependency
-    SentenceTransformer = None
+from app.core.config import settings
 
 from . import models
 
@@ -23,10 +21,14 @@ logger = logging.getLogger(__name__)
 
 
 class DocumentRepository:
+    """Persistence helpers for documents and their chunks."""
+
     def __init__(self, session: Session):
+        """Store the active SQLModel session for subsequent operations."""
         self.session = session
 
     def get_by_checksum(self, checksum: str) -> Optional[models.Document]:
+        """Return the document that matches ``checksum`` if it exists."""
         statement = (
             select(models.Document)
             .where(models.Document.checksum == checksum)
@@ -35,6 +37,7 @@ class DocumentRepository:
         return self.session.exec(statement).first()
 
     def list_documents(self) -> List[models.Document]:
+        """Return all documents ordered by newest first with eager-loaded chunks."""
         statement = (
             select(models.Document)
             .options(selectinload(models.Document.chunks))
@@ -51,6 +54,7 @@ class DocumentRepository:
         original_path: Optional[str],
         extra: Optional[dict] = None,
     ) -> models.Document:
+        """Insert a new document row and return the persisted instance."""
         document = models.Document(
             display_name=display_name,
             media_type=media_type,
@@ -67,6 +71,7 @@ class DocumentRepository:
         document: models.Document,
         chunks: Sequence[models.DocumentChunk],
     ) -> List[models.DocumentChunk]:
+        """Persist the supplied chunk models for ``document`` in a single batch."""
         stored = []
         for chunk in chunks:
             chunk.document_id = document.id  # ensure FK set
@@ -76,6 +81,7 @@ class DocumentRepository:
         return stored
 
     def delete_document(self, document: models.Document) -> None:
+        """Remove a document and all dependent graph/candidate records."""
         # Delete edge sources tied to this document's chunks first to maintain referential integrity
         chunk_ids = [chunk.id for chunk in document.chunks]
         if chunk_ids:
@@ -120,20 +126,26 @@ class DocumentRepository:
 
 
 class CanonicalTermRepository:
+    """CRUD helpers for canonical vocabulary management."""
+
     def __init__(self, session: Session):
+        """Keep a reference to the active session."""
         self.session = session
 
     def find_best_match(self, label: str) -> Optional[models.CanonicalTerm]:
+        """Return a canonical term whose label exactly matches ``label``."""
         statement = select(models.CanonicalTerm).where(models.CanonicalTerm.label == label)
         return self.session.exec(statement).first()
 
     def add_alias(self, term: models.CanonicalTerm, alias: str) -> None:
+        """Append ``alias`` to ``term`` if it is not already present."""
         if alias not in term.aliases:
             term.aliases.append(alias)
             term.last_reviewed_at = datetime.utcnow()
             self.session.add(term)
 
     def remove_alias(self, term: models.CanonicalTerm, alias: str) -> None:
+        """Remove ``alias`` from ``term`` when it exists."""
         if alias in term.aliases:
             term.aliases.remove(alias)
             term.last_reviewed_at = datetime.utcnow()
@@ -146,6 +158,7 @@ class CanonicalTermRepository:
         entity_type: Optional[str] = None,
         authority_source: Optional[str] = None,
     ) -> models.CanonicalTerm:
+        """Insert or fetch a canonical term by label, updating optional metadata."""
         statement = select(models.CanonicalTerm).where(models.CanonicalTerm.label == label)
         term = self.session.exec(statement).first()
         if term:
@@ -164,10 +177,12 @@ class CanonicalTermRepository:
         return term
 
     def list_terms(self) -> List[models.CanonicalTerm]:
+        """Return all canonical terms sorted alphabetically."""
         statement = select(models.CanonicalTerm).order_by(models.CanonicalTerm.label)
         return list(self.session.exec(statement))
 
     def delete(self, term: models.CanonicalTerm) -> None:
+        """Remove ``term`` and detach any linked nodes."""
         # Nullify canonical references in nodes
         nodes_stmt = select(models.Node).where(models.Node.canonical_term_id == term.id)
         for node in self.session.exec(nodes_stmt):
@@ -179,10 +194,14 @@ class CanonicalTermRepository:
 
 
 class NodeRepository:
+    """Utility methods for reading or creating graph nodes."""
+
     def __init__(self, session: Session):
+        """Bind the repository to a SQLModel session."""
         self.session = session
 
     def get_by_label(self, label: str) -> Optional[models.Node]:
+        """Return a node matching ``label`` including its attributes."""
         statement = (
             select(models.Node)
             .where(models.Node.label == label)
@@ -198,6 +217,7 @@ class NodeRepository:
         canonical_term: Optional[models.CanonicalTerm],
         sme_override: bool = False,
     ) -> models.Node:
+        """Fetch or create a node, lazily attaching canonical metadata if needed."""
         node = self.get_by_label(label)
         if node:
             if canonical_term and node.canonical_term_id is None:
@@ -215,7 +235,10 @@ class NodeRepository:
 
 
 class NodeAttributeRepository:
+    """Manage scalar attribute state for nodes."""
+
     def __init__(self, session: Session):
+        """Store the active session for use in mutations."""
         self.session = session
 
     def upsert_many(
@@ -223,6 +246,7 @@ class NodeAttributeRepository:
         node: models.Node,
         attributes: Sequence[Dict[str, object]],
     ) -> None:
+        """Create or update the provided ``attributes`` for ``node``."""
         if not attributes:
             return
         existing = {
@@ -266,7 +290,10 @@ class NodeAttributeRepository:
             record.updated_at = datetime.utcnow()
 
 class CandidateRepository:
+    """Operations for managing candidate triples awaiting SME review."""
+
     def __init__(self, session: Session):
+        """Store the SQLModel session."""
         self.session = session
 
     def add_candidates(
@@ -275,6 +302,7 @@ class CandidateRepository:
         chunk: models.DocumentChunk,
         triples: Iterable[models.CandidateTriple],
     ) -> List[models.CandidateTriple]:
+        """Persist ``triples`` for ``chunk`` and return the stored objects."""
         stored = []
         for triple in triples:
             triple.chunk_id = chunk.id
@@ -284,9 +312,11 @@ class CandidateRepository:
         return stored
 
     def get(self, candidate_id: int) -> Optional[models.CandidateTriple]:
+        """Return a candidate by primary key or ``None`` when missing."""
         return self.session.get(models.CandidateTriple, candidate_id)
 
     def list_pending(self, limit: int = 50) -> List[models.CandidateTriple]:
+        """Fetch the next ``limit`` candidates awaiting review."""
         statement = (
             select(models.CandidateTriple)
             .where(models.CandidateTriple.status == models.CandidateStatus.pending)
@@ -296,6 +326,7 @@ class CandidateRepository:
         return list(self.session.exec(statement))
 
     def count_for_document(self, document_id: int) -> int:
+        """Return how many candidates originate from ``document_id``."""
         statement = (
             select(func.count())
             .select_from(models.CandidateTriple)
@@ -311,6 +342,7 @@ class CandidateRepository:
         predicate: str,
         obj: str,
     ) -> Optional[models.CandidateTriple]:
+        """Return an existing candidate matching the supplied triple values."""
         statement = (
             select(models.CandidateTriple)
             .where(models.CandidateTriple.subject_text == subject)
@@ -327,6 +359,7 @@ class CandidateRepository:
         *,
         status: models.CandidateStatus,
     ) -> models.CandidateTriple:
+        """Persist a status transition for ``candidate`` and return it."""
         candidate.status = status
         candidate.updated_at = datetime.utcnow()
         self.session.add(candidate)
@@ -334,7 +367,10 @@ class CandidateRepository:
 
 
 class GraphRepository:
+    """Coordinate node creation, edge persistence, and lightweight ontology audits."""
+
     def __init__(self, session: Session):
+        """Initialise helper repositories and ensure embeddings are ready."""
         self.session = session
         self.nodes = NodeRepository(session)
         self.node_attributes = NodeAttributeRepository(session)
@@ -360,6 +396,7 @@ class GraphRepository:
         tags: Optional[Sequence[str]] = None,
         created_by: Optional[str] = None,
     ) -> models.Edge:
+        """Persist an edge with provenance, normalising optional attributes and tags."""
         subject_node = self.nodes.ensure_node(
             label=subject_label,
             entity_type=entity_type_subject,
@@ -373,10 +410,13 @@ class GraphRepository:
             sme_override=canonical_object is None,
         )
 
-        if subject_attributes:
-            self.node_attributes.upsert_many(subject_node, subject_attributes)
-        if object_attributes:
-            self.node_attributes.upsert_many(object_node, object_attributes)
+        normalized_subject_attributes = self._normalize_attributes(subject_attributes)
+        normalized_object_attributes = self._normalize_attributes(object_attributes)
+
+        if normalized_subject_attributes:
+            self.node_attributes.upsert_many(subject_node, normalized_subject_attributes)
+        if normalized_object_attributes:
+            self.node_attributes.upsert_many(object_node, normalized_object_attributes)
 
         self._embedding_store.bulk_add([subject_node.label, object_node.label])
 
@@ -430,7 +470,94 @@ class GraphRepository:
 
         return edge
 
+    def _normalize_attributes(
+        self, attributes: Optional[Sequence[Dict[str, object]]]
+    ) -> List[Dict[str, object]]:
+        """Normalise external attribute payloads into a standard schema."""
+        if not attributes:
+            return []
+
+        normalized: Dict[str, Dict[str, object]] = {}
+        for raw in attributes:
+            if not isinstance(raw, dict):
+                continue
+            name_raw = raw.get("name") or raw.get("label")
+            if not name_raw:
+                continue
+            name = str(name_raw).strip()
+            if not name:
+                continue
+
+            data_type = raw.get("data_type")
+            if isinstance(data_type, models.NodeAttributeType):
+                data_type_enum = data_type
+            elif isinstance(data_type, str):
+                try:
+                    data_type_enum = models.NodeAttributeType(data_type)
+                except ValueError:
+                    data_type_enum = None
+            else:
+                data_type_enum = None
+
+            value_text = raw.get("value_text")
+            value_number = raw.get("value_number")
+            value_boolean = raw.get("value_boolean")
+
+            if value_text is None and value_number is None and value_boolean is None:
+                value = raw.get("value")
+                if isinstance(value, bool):
+                    data_type_enum = data_type_enum or models.NodeAttributeType.boolean
+                    value_boolean = value
+                elif isinstance(value, (int, float)):
+                    data_type_enum = data_type_enum or models.NodeAttributeType.number
+                    value_number = float(value)
+                elif value is not None:
+                    text_value = str(value).strip()
+                    if data_type_enum is None:
+                        lowered = text_value.lower()
+                        if lowered in {"true", "false", "yes", "no"}:
+                            data_type_enum = models.NodeAttributeType.boolean
+                            value_boolean = lowered in {"true", "yes"}
+                        else:
+                            try:
+                                numeric = float(text_value)
+                            except ValueError:
+                                if len(text_value.split()) <= 3 and lowered.replace("_", "").isalnum():
+                                    data_type_enum = models.NodeAttributeType.enum
+                                else:
+                                    data_type_enum = models.NodeAttributeType.string
+                                value_text = text_value
+                            else:
+                                data_type_enum = models.NodeAttributeType.number
+                                value_number = numeric
+                    else:
+                        value_text = text_value
+
+            if data_type_enum is None:
+                if value_number is not None:
+                    data_type_enum = models.NodeAttributeType.number
+                elif value_boolean is not None:
+                    data_type_enum = models.NodeAttributeType.boolean
+                else:
+                    data_type_enum = models.NodeAttributeType.string
+
+            if data_type_enum == models.NodeAttributeType.string and value_text is None:
+                fallback_value = raw.get("value")
+                if fallback_value is not None:
+                    value_text = str(fallback_value)
+
+            normalized[name.lower()] = {
+                "name": name,
+                "data_type": data_type_enum,
+                "value_text": value_text,
+                "value_number": value_number,
+                "value_boolean": value_boolean,
+            }
+
+        return list(normalized.values())
+
     def count_edges_for_document(self, document_id: int) -> int:
+        """Return the number of distinct edges attributed to ``document_id``."""
         statement = (
             select(func.count(func.distinct(models.Edge.id)))
             .select_from(models.Edge)
@@ -439,8 +566,9 @@ class GraphRepository:
             .where(models.DocumentChunk.document_id == document_id)
         )
         return self.session.exec(statement).one()
-    
+
     def audit_ontology(self) -> dict:
+        """Produce heuristics highlighting potential class gaps or ambiguous predicates."""
         all_nodes = list(self.session.exec(select(models.Node)))
         isa_edges = list(self.session.exec(select(models.Edge).where(models.Edge.predicate == 'is_a')))
         isa_subject_ids = {edge.subject_node_id for edge in isa_edges}
@@ -463,7 +591,10 @@ class GraphRepository:
 
 
 class SMEActionRepository:
+    """Record SME actions for provenance and audit trails."""
+
     def __init__(self, session: Session):
+        """Bind to the active session."""
         self.session = session
 
     def record_action(
@@ -474,6 +605,7 @@ class SMEActionRepository:
         candidate: Optional[models.CandidateTriple],
         payload: Optional[dict] = None,
     ) -> models.SMEAction:
+        """Create a new SME action row and return it."""
         action = models.SMEAction(
             action_type=action_type,
             actor=actor,
@@ -578,62 +710,50 @@ class OntologySuggestionRepository:
 
 
 class NodeEmbeddingStore:
-    _MODEL_CACHE: Optional[SentenceTransformer] = None
-    _MODEL_NAME: Optional[str] = None
+    """Shared in-memory embedding index for node labels."""
+
     _BACKEND: str = "fuzzy"
     _LABELS: List[str] = []
     _LABEL_TO_INDEX: Dict[str, int] = {}
     _VECTORS: Optional[np.ndarray] = None
     _LOCK = threading.Lock()
+    _EMBEDDING_DIM: Optional[int] = None
+    _EXTERNAL_ENDPOINT: Optional[str] = None
+    _EXTERNAL_API_KEY: Optional[str] = None
+    _EXTERNAL_DEPLOYMENT: Optional[str] = None
 
-    def __init__(self, embedding_model: str = "all-MiniLM-L6-v2"):
+    def __init__(self, embedding_model: str = "external"):
+        """Initialise the similarity backend, preferring configured external embeddings."""
         self.embedding_model = embedding_model
-        if SentenceTransformer and NodeEmbeddingStore._MODEL_CACHE is None:
-            try:
-                NodeEmbeddingStore._MODEL_CACHE = SentenceTransformer(embedding_model)
-                NodeEmbeddingStore._MODEL_NAME = embedding_model
-                NodeEmbeddingStore._BACKEND = "embedding"
-            except Exception:  # pragma: no cover - optional dependency load failure
-                logger.exception(
-                    "Failed to load embedding model '%s'. Falling back to fuzzy matching.",
-                    embedding_model,
-                )
-                NodeEmbeddingStore._MODEL_CACHE = None
-                NodeEmbeddingStore._MODEL_NAME = None
-                NodeEmbeddingStore._BACKEND = "fuzzy"
-        elif SentenceTransformer is None:
+        if settings.embedding_endpoint:
+            NodeEmbeddingStore._EXTERNAL_ENDPOINT = settings.embedding_endpoint
+            NodeEmbeddingStore._EXTERNAL_API_KEY = settings.embedding_api_key
+            NodeEmbeddingStore._EXTERNAL_DEPLOYMENT = settings.embedding_deployment
+            NodeEmbeddingStore._BACKEND = "external"
+        else:
             NodeEmbeddingStore._BACKEND = "fuzzy"
-        elif (
-            NodeEmbeddingStore._BACKEND == "embedding"
-            and NodeEmbeddingStore._MODEL_NAME
-            and NodeEmbeddingStore._MODEL_NAME != embedding_model
-        ):
-            logger.warning(
-                "NodeEmbeddingStore already initialised with model '%s'; ignoring request for '%s'.",
-                NodeEmbeddingStore._MODEL_NAME,
-                embedding_model,
-            )
 
     @property
     def backend(self) -> str:
+        """Return the current similarity backend (``external`` or ``fuzzy``)."""
         return NodeEmbeddingStore._BACKEND
 
     def has_entries(self) -> bool:
+        """Return ``True`` when at least one label has been cached."""
         return bool(NodeEmbeddingStore._LABELS)
 
     def encode_labels(self, labels: Sequence[str]) -> Optional[np.ndarray]:
-        if NodeEmbeddingStore._BACKEND != "embedding" or NodeEmbeddingStore._MODEL_CACHE is None:
+        """Encode ``labels`` using the configured external embedding endpoint."""
+        if NodeEmbeddingStore._BACKEND != "external":
             return None
         if not labels:
-            dimension = NodeEmbeddingStore._MODEL_CACHE.get_sentence_embedding_dimension()
-            return np.empty((0, dimension))
-        return NodeEmbeddingStore._MODEL_CACHE.encode(
-            list(labels),
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
+            if NodeEmbeddingStore._EMBEDDING_DIM is None:
+                return np.empty((0, 0))
+            return np.empty((0, NodeEmbeddingStore._EMBEDDING_DIM))
+        return self._embed_external(labels)
 
     def bulk_add(self, labels: Sequence[str]) -> None:
+        """Add ``labels`` to the similarity index if not already present."""
         cleaned = [label.strip() for label in labels if label and isinstance(label, str) and label.strip()]
         if not cleaned:
             return
@@ -648,12 +768,8 @@ class NodeEmbeddingStore:
                 return
 
             vectors: Optional[np.ndarray] = None
-            if NodeEmbeddingStore._BACKEND == "embedding" and NodeEmbeddingStore._MODEL_CACHE is not None:
-                vectors = NodeEmbeddingStore._MODEL_CACHE.encode(
-                    to_add,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                )
+            if NodeEmbeddingStore._BACKEND == "external":
+                vectors = self._embed_external(to_add)
 
             for idx, label in enumerate(to_add):
                 key = label.lower()
@@ -667,31 +783,32 @@ class NodeEmbeddingStore:
                         NodeEmbeddingStore._VECTORS = np.vstack([NodeEmbeddingStore._VECTORS, vector])
 
     def suggest_similar(self, label: str, top_k: int = 5) -> List[Tuple[str, float]]:
+        """Return up to ``top_k`` labels similar to ``label`` using current backend."""
         if not NodeEmbeddingStore._LABELS:
             return []
 
         label_key = label.lower()
         results: List[Tuple[str, float]] = []
         if (
-            NodeEmbeddingStore._BACKEND == "embedding"
-            and NodeEmbeddingStore._MODEL_CACHE is not None
+            NodeEmbeddingStore._BACKEND == "external"
             and NodeEmbeddingStore._VECTORS is not None
+            and NodeEmbeddingStore._LABELS
         ):
-            query_vector = NodeEmbeddingStore._MODEL_CACHE.encode(
-                [label],
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            )[0]
-            similarities = NodeEmbeddingStore._VECTORS @ query_vector
-            order = np.argsort(-similarities)
-            for idx in order:
-                candidate_label = NodeEmbeddingStore._LABELS[idx]
-                if candidate_label.lower() == label_key:
-                    continue
-                results.append((candidate_label, float(similarities[idx])))
-                if len(results) >= top_k:
-                    break
-            return results
+            embedding = self._embed_external([label])
+            if embedding is None or embedding.size == 0:
+                logger.warning("External embedding call failed during query; falling back to fuzzy matching")
+            else:
+                query_vector = embedding[0]
+                similarities = NodeEmbeddingStore._VECTORS @ query_vector
+                order = np.argsort(-similarities)
+                for idx in order:
+                    candidate_label = NodeEmbeddingStore._LABELS[idx]
+                    if candidate_label.lower() == label_key:
+                        continue
+                    results.append((candidate_label, float(similarities[idx])))
+                    if len(results) >= top_k:
+                        break
+                return results
 
         scores: List[Tuple[str, float]] = []
         for candidate_label in NodeEmbeddingStore._LABELS:
@@ -704,31 +821,32 @@ class NodeEmbeddingStore:
         return scores[:top_k]
 
     def bootstrap_from_session(self, session: Session) -> None:
+        """Populate the store with existing node labels from the database."""
         labels = [node.label for node in session.exec(select(models.Node)) if node.label]
         self.bulk_add(labels)
 
     def query(self, text: str, top_k: int = 8) -> List[Tuple[str, float]]:
+        """Return labels similar to ``text`` using embeddings or fuzzy fallback."""
         if not NodeEmbeddingStore._LABELS:
             return []
 
         if (
-            NodeEmbeddingStore._BACKEND == "embedding"
-            and NodeEmbeddingStore._MODEL_CACHE is not None
+            NodeEmbeddingStore._BACKEND == "external"
             and NodeEmbeddingStore._VECTORS is not None
+            and NodeEmbeddingStore._LABELS
         ):
-            query_vector = NodeEmbeddingStore._MODEL_CACHE.encode(
-                [text],
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            )[0]
-            similarities = NodeEmbeddingStore._VECTORS @ query_vector
-            order = np.argsort(-similarities)
-            results: List[Tuple[str, float]] = []
-            for idx in order[:top_k * 2]:
-                candidate_label = NodeEmbeddingStore._LABELS[idx]
-                score = float(similarities[idx])
-                results.append((candidate_label, score))
-            return sorted(results, key=lambda item: item[1], reverse=True)[:top_k]
+            embedding = self._embed_external([text])
+            if embedding is not None and embedding.size:
+                query_vector = embedding[0]
+                similarities = NodeEmbeddingStore._VECTORS @ query_vector
+                order = np.argsort(-similarities)
+                results: List[Tuple[str, float]] = []
+                for idx in order[: top_k * 2]:
+                    candidate_label = NodeEmbeddingStore._LABELS[idx]
+                    score = float(similarities[idx])
+                    results.append((candidate_label, score))
+                return sorted(results, key=lambda item: item[1], reverse=True)[:top_k]
+            logger.warning("External embedding call failed; using fuzzy similarity for '%s'", text)
 
         scores: List[Tuple[str, float]] = []
         for candidate_label in NodeEmbeddingStore._LABELS:
@@ -737,3 +855,68 @@ class NodeEmbeddingStore:
                 scores.append((candidate_label, float(score)))
         scores.sort(key=lambda item: item[1], reverse=True)
         return scores[:top_k]
+
+    def _embed_external(self, texts: Sequence[str]) -> Optional[np.ndarray]:
+        """Call the configured embedding endpoint and return normalised vectors."""
+        if not texts:
+            return np.empty((0, NodeEmbeddingStore._EMBEDDING_DIM or 0))
+        if not NodeEmbeddingStore._EXTERNAL_ENDPOINT:
+            return None
+
+        payload: Dict[str, object] = {"input": list(texts)}
+        if NodeEmbeddingStore._EXTERNAL_DEPLOYMENT:
+            payload["model"] = NodeEmbeddingStore._EXTERNAL_DEPLOYMENT
+
+        headers = {"Content-Type": "application/json"}
+        if NodeEmbeddingStore._EXTERNAL_API_KEY:
+            headers["Authorization"] = f"Bearer {NodeEmbeddingStore._EXTERNAL_API_KEY}"
+            headers["api-key"] = NodeEmbeddingStore._EXTERNAL_API_KEY
+
+        try:
+            response = requests.post(
+                NodeEmbeddingStore._EXTERNAL_ENDPOINT,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=30,
+            )
+            response.raise_for_status()
+            body = response.json()
+        except Exception:  # noqa: BLE001
+            logger.exception("Embedding request failed; reverting to fuzzy similarity")
+            NodeEmbeddingStore._BACKEND = "fuzzy"
+            return None
+
+        vectors: List[Sequence[float]] = []
+        if isinstance(body, dict):
+            data_field = body.get("data")
+            if isinstance(data_field, list):
+                for item in data_field:
+                    if isinstance(item, dict):
+                        embedding = item.get("embedding") or item.get("vector")
+                        if embedding is not None:
+                            vectors.append(embedding)
+            elif isinstance(body.get("embeddings"), list):
+                vectors = body["embeddings"]
+        elif isinstance(body, list):
+            vectors = body
+
+        if not vectors:
+            logger.warning("Embedding endpoint returned no vectors; using fuzzy similarity")
+            return None
+        if len(vectors) != len(texts):
+            logger.warning(
+                "Embedding endpoint returned %s vectors for %s inputs",
+                len(vectors),
+                len(texts),
+            )
+
+        arr = np.array(vectors, dtype=float)
+        if arr.ndim != 2:
+            logger.warning("Embedding response has unexpected shape %s", arr.shape)
+            return None
+
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        arr = arr / norms
+        NodeEmbeddingStore._EMBEDDING_DIM = arr.shape[1]
+        return arr

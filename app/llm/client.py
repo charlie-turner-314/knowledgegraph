@@ -16,6 +16,7 @@ from .schemas import (
     ExtractionResponse,
     OntologyParentSuggestion,
     OntologySuggestionResponse,
+    ConnectionRecommendationResponse,
     QueryAnswerResponse,
     QueryPlanResponse,
     QueryRetrievalResponse,
@@ -38,6 +39,9 @@ QUERY_PLAN_PROMPT_PATH = (
 )
 QUERY_ANSWER_PROMPT_PATH = (
     Path(__file__).resolve().parents[2] / "resources" / "prompts" / "query_answer_prompt.txt"
+)
+CONNECTION_RECOMMENDATION_PROMPT_PATH = (
+    Path(__file__).resolve().parents[2] / "resources" / "prompts" / "connection_recommendation_prompt.txt"
 )
 
 
@@ -98,16 +102,30 @@ def _load_query_answer_prompt() -> str:
         return "Summarize the answer from the supplied triples."
 
 
-class GemmaClient:
+@functools.lru_cache(maxsize=1)
+def _load_connection_recommendation_prompt() -> str:
+    try:
+        return CONNECTION_RECOMMENDATION_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.warning(
+            "Connection recommendation prompt file %s missing; using fallback text",
+            CONNECTION_RECOMMENDATION_PROMPT_PATH,
+        )
+        return "Assess whether new nodes or edges are needed. Return empty lists when no changes are required."
+
+
+class LLMClient:
+    """Lightweight client for a chat-completions style LLM endpoint."""
+
     def __init__(self, endpoint: Optional[str] = None, api_key: Optional[str] = None):
-        self.endpoint = endpoint or settings.gemma_endpoint
-        self.api_key = api_key or settings.gemma_api_key
+        self.endpoint = endpoint or settings.llm_endpoint
+        self.api_key = api_key or settings.llm_api_key
         self._dry_run = self.endpoint is None
 
     @retry(wait=wait_random_exponential(multiplier=1, max=10), stop=stop_after_attempt(3))
     def _call_api(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if self.endpoint is None:
-            logger.error("Endpoint is none - not calling api endpoint")
+            logger.error("LLM endpoint missing; skipping API call")
             return {}
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -125,13 +143,13 @@ class GemmaClient:
         metadata: Optional[Dict[str, Any]] = None,
         canonical_context: Optional[List[Dict[str, Any]]] = None,
     ) -> ExtractionResponse:
-        """Call Gemma to extract triples from a chunk of text."""
+        """Call the configured LLM to extract triples from text."""
 
         if self._dry_run:
-            logger.warning("Gemma endpoint not configured; returning stubbed triple response")
+            logger.warning("LLM endpoint not configured; returning stubbed triple response")
             stub = ExtractionResponse(
                 triples=[],
-                raw_response={"error": "gemma_endpoint_not_configured"},
+                raw_response={"error": "llm_endpoint_not_configured"},
             )
             return stub
 
@@ -184,8 +202,8 @@ class GemmaClient:
         try:
             raw = self._call_api(payload)
         except RetryError as exc:
-            logger.exception("Gemma triple extraction failed after retries")
-            raise RuntimeError("Gemma triple extraction failed") from exc
+            logger.exception("LLM triple extraction failed after retries")
+            raise RuntimeError("LLM triple extraction failed") from exc
 
         try:
             message_content = raw.get("choices", [{}])[0].get("message", {}).get("content", {})
@@ -202,8 +220,8 @@ class GemmaClient:
                 }
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to parse Gemma extraction response")
-            raise RuntimeError("Invalid response from Gemma extraction endpoint") from exc
+            logger.exception("Failed to parse LLM extraction response")
+            raise RuntimeError("Invalid response from LLM extraction endpoint") from exc
 
         return parsed
 
@@ -228,7 +246,7 @@ class GemmaClient:
             )
             return OntologySuggestionResponse(
                 suggestion=suggestion,
-                raw_response={"error": "gemma_endpoint_not_configured"},
+                raw_response={"error": "llm_endpoint_not_configured"},
             )
 
         system_prompt = _load_ontology_prompt()
@@ -288,7 +306,7 @@ class GemmaClient:
                 intent="heuristic",
                 notes="LLM retrieval stub",
                 context_nodes=context.get("nodes", []),
-                raw_response={"error": "gemma_endpoint_not_configured"},
+                raw_response={"error": "llm_endpoint_not_configured"},
             )
 
         system_prompt = _load_query_retrieval_prompt()
@@ -399,7 +417,7 @@ class GemmaClient:
                 cited_edges=[m.get("edge_id") for m in matches[:5] if m.get("edge_id")],
                 confidence=0.3,
                 notes="LLM answer stub",
-                raw_response={"error": "gemma_endpoint_not_configured"},
+                raw_response={"error": "llm_endpoint_not_configured"},
             )
 
         system_prompt = _load_query_answer_prompt()
@@ -434,9 +452,50 @@ class GemmaClient:
             }
         )
 
+    def recommend_connections(self, payload: Dict[str, Any]) -> ConnectionRecommendationResponse:
+        if self._dry_run:
+            return ConnectionRecommendationResponse(
+                new_nodes=[],
+                new_edges=[],
+                notes="LLM connection recommendation stub",
+                raw_response={"error": "llm_endpoint_not_configured"},
+            )
 
-def get_client() -> GemmaClient:
-    return GemmaClient()
+        system_prompt = _load_connection_recommendation_prompt()
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": orjson.dumps(payload).decode(),
+            },
+        ]
+        request_payload = {
+            "messages": messages,
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+        raw = self._call_api(request_payload)
+        message_content = raw.get("choices", [{}])[0].get("message", {}).get("content", {})
+        if isinstance(message_content, str):
+            parsed_content = orjson.loads(message_content)
+        elif isinstance(message_content, dict):
+            parsed_content = message_content
+        else:
+            parsed_content = {}
+
+        return ConnectionRecommendationResponse.model_validate(
+            {
+                "new_nodes": parsed_content.get("new_nodes", []),
+                "new_edges": parsed_content.get("new_edges", []),
+                "notes": parsed_content.get("notes"),
+                "raw_response": raw,
+            }
+        )
+
+
+def get_client() -> LLMClient:
+    """Return a singleton LLM client using application settings."""
+    return LLMClient()
 
 
 def _heuristic_parent_label(child_labels: Sequence[str]) -> str:

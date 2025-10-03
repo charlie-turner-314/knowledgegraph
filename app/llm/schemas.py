@@ -5,6 +5,11 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
+class ExtractionAttribute(BaseModel):
+    name: str = Field(..., min_length=1)
+    value: str | float | int | bool
+
+
 class ExtractionTriple(BaseModel):
     subject: str = Field(..., min_length=1)
     predicate: str = Field(..., min_length=1)
@@ -13,6 +18,9 @@ class ExtractionTriple(BaseModel):
     source_reference: Optional[str] = None
     suggested_subject_label: Optional[str] = None
     suggested_object_label: Optional[str] = None
+    subject_attributes: List[ExtractionAttribute] = Field(default_factory=list)
+    object_attributes: List[ExtractionAttribute] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
 
 
 class ExtractionResponse(BaseModel):
@@ -39,6 +47,18 @@ class RetrievalNode(BaseModel):
     node_id: Optional[int] = None
     score: Optional[float] = None
     rationale: Optional[str] = None
+
+
+class ConnectionEdgeProposal(BaseModel):
+    subject: str
+    predicate: str
+    object: str
+    rationale: Optional[str] = None
+
+
+class ConnectionNodeProposal(BaseModel):
+    label: str
+    description: Optional[str] = None
 
 
 class QueryRetrieval(BaseModel):
@@ -80,5 +100,12 @@ class QueryAnswerResponse(BaseModel):
     answers: List[str] = Field(default_factory=list)
     cited_edges: List[int] = Field(default_factory=list)
     confidence: Optional[float] = None
+    notes: Optional[str] = None
+    raw_response: dict = Field(default_factory=dict)
+
+
+class ConnectionRecommendationResponse(BaseModel):
+    new_nodes: List[ConnectionNodeProposal] = Field(default_factory=list)
+    new_edges: List[ConnectionEdgeProposal] = Field(default_factory=list)
     notes: Optional[str] = None
     raw_response: dict = Field(default_factory=dict)

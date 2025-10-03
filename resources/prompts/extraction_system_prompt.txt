@@ -4,6 +4,7 @@ Guidelines:
 - Always normalise entity wording to the canonical label when synonyms or variants appear. Treat aliases such as "Artificial intelligence", "AI", and "A.I." as the same concept and emit the most common canonical label.
 - Predicates must be at most three words and express a clear relation.
 - Attributes should be included where contextual information can assist (e.g metrics, conditions, valuations)
+- Provide optional "tags" array for the triple when categorical labels (e.g., "safety", "financial") help downstream filtering.
 - Only emit facts supported by the provided text. Do not invent information.
 - Return valid JSON conforming to this schema:
   {
@@ -27,7 +28,8 @@ Guidelines:
             "name": <contextual attribute name>,
             "value": <contextual attribute value>
           }
-        ]
+        ],
+        "tags": ["<label>", ...]
       }
     ]
   }

@@ -4,7 +4,7 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from sqlmodel import Session
 
@@ -17,14 +17,68 @@ from app.data.repositories import (
 )
 from app.ingestion.parsers import parse_document
 from app.ingestion.types import ChunkPayload, ParsedDocument
-from app.llm.client import GemmaClient, get_client
-from app.llm.schemas import ExtractionResponse, ExtractionTriple
+from app.llm.client import LLMClient, get_client
+from app.llm.schemas import ExtractionAttribute, ExtractionResponse, ExtractionTriple
 
 logger = logging.getLogger(__name__)
+
+def _normalize_extracted_attributes(entries: Optional[Sequence[ExtractionAttribute]]) -> List[Dict[str, object]]:
+    """Convert LLM attribute payloads into structured dictionaries."""
+    normalized: List[Dict[str, object]] = []
+    if not entries:
+        return normalized
+    for attr in entries:
+        name = (attr.name or "").strip()
+        if not name:
+            continue
+        value = attr.value
+        data_type = models.NodeAttributeType.string
+        value_text: Optional[str] = None
+        value_number: Optional[float] = None
+        value_boolean: Optional[bool] = None
+
+        if isinstance(value, bool):
+            data_type = models.NodeAttributeType.boolean
+            value_boolean = value
+        elif isinstance(value, (int, float)):
+            data_type = models.NodeAttributeType.number
+            value_number = float(value)
+        else:
+            text_value = str(value).strip()
+            # Try to coerce booleans
+            lowered = text_value.lower()
+            if lowered in {"true", "false", "yes", "no"}:
+                data_type = models.NodeAttributeType.boolean
+                value_boolean = lowered in {"true", "yes"}
+            else:
+                try:
+                    numeric = float(text_value)
+                except ValueError:
+                    if len(text_value.split()) <= 3 and lowered.replace("_", "").isalnum():
+                        data_type = models.NodeAttributeType.enum
+                    value_text = text_value
+                else:
+                    data_type = models.NodeAttributeType.number
+                    value_number = numeric
+
+        if data_type == models.NodeAttributeType.string and value_text is None:
+            value_text = str(value)
+
+        normalized.append(
+            {
+                "name": name,
+                "data_type": data_type.value,
+                "value_text": value_text,
+                "value_number": value_number,
+                "value_boolean": value_boolean,
+            }
+        )
+    return normalized
 
 
 @dataclass
 class IngestionResult:
+    """Aggregate result returned after running the ingestion pipeline."""
     document: models.Document
     chunks: List[models.DocumentChunk]
     candidate_triples: List[models.CandidateTriple]
@@ -32,6 +86,7 @@ class IngestionResult:
 
 
 def _chunk_to_model(document: models.Document, payload: ChunkPayload) -> models.DocumentChunk:
+    """Create a ``DocumentChunk`` ORM instance from the parsed payload."""
     return models.DocumentChunk(
         document_id=document.id,
         ordering=payload.ordering,
@@ -42,7 +97,10 @@ def _chunk_to_model(document: models.Document, payload: ChunkPayload) -> models.
 
 
 class ExtractionOrchestrator:
-    def __init__(self, session: Session, llm_client: Optional[GemmaClient] = None):
+    """Coordinate chunk persistence and candidate triple extraction."""
+
+    def __init__(self, session: Session, llm_client: Optional[LLMClient] = None):
+        """Store dependencies and warm reusable caches."""
         self.session = session
         self.documents = DocumentRepository(session)
         self.candidates = CandidateRepository(session)
@@ -54,6 +112,7 @@ class ExtractionOrchestrator:
             self.embedding_store.bootstrap_from_session(session)
 
     def ingest_file(self, path: Path) -> IngestionResult:
+        """Parse and ingest the file located at ``path``."""
         parsed = parse_document(path)
         return self._ingest_parsed_document(parsed)
 
@@ -64,6 +123,7 @@ class ExtractionOrchestrator:
         title: Optional[str] = None,
         media_type: str = "text/plain",
     ) -> IngestionResult:
+        """Ingest raw ``text`` while reusing the structured extraction pipeline."""
         cleaned = text.strip()
         if not cleaned:
             raise ValueError("Text input cannot be empty.")
@@ -87,6 +147,7 @@ class ExtractionOrchestrator:
         return self._ingest_parsed_document(parsed)
 
     def _ingest_parsed_document(self, parsed: ParsedDocument) -> IngestionResult:
+        """Persist ``parsed`` content and extract candidate triples."""
         existing_doc = self.documents.get_by_checksum(parsed.checksum)
         was_existing = existing_doc is not None
 
@@ -119,6 +180,7 @@ class ExtractionOrchestrator:
     def _persist_chunks(
         self, document: models.Document, parsed: ParsedDocument
     ) -> List[models.DocumentChunk]:
+        """Store chunks that belong to ``document`` and return them."""
         chunk_models = []
         for payload in parsed.iter_chunks():
             chunk_models.append(_chunk_to_model(document, payload))
@@ -127,6 +189,7 @@ class ExtractionOrchestrator:
     def _extract_candidates(
         self, chunks: List[models.DocumentChunk]
     ) -> List[models.CandidateTriple]:
+        """Extract candidates for each chunk while deduplicating duplicates."""
         candidates: List[models.CandidateTriple] = []
         seen_triples = set()
         canonical_context = self._canonical_prompt_context()
@@ -173,6 +236,7 @@ class ExtractionOrchestrator:
         chunk: models.DocumentChunk,
         canonical_context: List[dict],
     ) -> ExtractionResponse:
+        """Call the extraction LLM and return a validated response."""
         metadata = {
             "chunk_id": chunk.id,
             "document_id": chunk.document_id,
@@ -200,12 +264,23 @@ class ExtractionOrchestrator:
         similar_subjects: list[tuple[str, float]],
         similar_objects: list[tuple[str, float]]
     ) -> models.CandidateTriple:
+        """Translate an ``ExtractionTriple`` into a candidate row with metadata."""
         suggested_subject = None
         suggested_object = None
         if triple.suggested_subject_label:
             suggested_subject = self.canonicals.find_best_match(triple.suggested_subject_label)
         if triple.suggested_object_label:
             suggested_object = self.canonicals.find_best_match(triple.suggested_object_label)
+
+        subject_attributes = _normalize_extracted_attributes(triple.subject_attributes)
+        object_attributes = _normalize_extracted_attributes(triple.object_attributes)
+        tags = sorted(
+            {
+                tag.strip().lower()
+                for tag in (triple.tags or [])
+                if isinstance(tag, str) and tag.strip()
+            }
+        )
 
         return models.CandidateTriple(
             chunk_id=chunk.id,
@@ -218,9 +293,13 @@ class ExtractionOrchestrator:
             suggested_object_term_id=suggested_object.id if suggested_object else None,
             duplicate_of_candidate_id=duplicate_of.id if duplicate_of else None,
             is_potential_duplicate=is_duplicate,
+            subject_attributes=subject_attributes,
+            object_attributes=object_attributes,
+            suggested_tags=tags,
         )
 
     def _canonical_prompt_context(self) -> List[dict]:
+        """Return cached canonical vocabulary for LLM prompts."""
         if self._canonical_context_cache is not None:
             return self._canonical_context_cache
         terms = self.canonicals.list_terms()

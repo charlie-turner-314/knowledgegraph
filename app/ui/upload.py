@@ -11,6 +11,7 @@ from app.utils.files import store_uploaded_file
 
 
 def render() -> None:
+    """Render the document ingestion interface for files and raw text."""
     st.header("Document Ingestion")
     st.write(
         "Provide knowledge via document upload or pasted text. "
@@ -31,6 +32,7 @@ def render() -> None:
 
 
 def _ingest_from_path(path: Path) -> Dict[str, Any]:
+    """Ingest a file from disk and return a summary dictionary."""
     with session_scope() as session:
         orchestrator = ExtractionOrchestrator(session)
         result = orchestrator.ingest_file(path)
@@ -52,6 +54,7 @@ def _ingest_from_path(path: Path) -> Dict[str, Any]:
 
 
 def _ingest_from_text(text: str, title: str) -> Dict[str, Any]:
+    """Ingest manually supplied ``text`` and return the resulting summary."""
     with session_scope() as session:
         orchestrator = ExtractionOrchestrator(session)
         result = orchestrator.ingest_text(text=text, title=title)
@@ -73,6 +76,7 @@ def _ingest_from_text(text: str, title: str) -> Dict[str, Any]:
 
 
 def _render_file_ingest() -> None:
+    """Render the file upload form and handle submissions."""
     with st.form("file_ingest_form"):
         uploaded_file = st.file_uploader(
             "Select a document",
@@ -88,7 +92,7 @@ def _render_file_ingest() -> None:
         st.error("Please select a file before submitting.")
         return
 
-    with st.spinner("Parsing document and querying Gemma…"):
+    with st.spinner("Parsing document and querying the LLM…"):
         stored_path = store_uploaded_file(uploaded_file.name, uploaded_file)
         ingestion_summary = _ingest_from_path(stored_path)
 
@@ -96,6 +100,7 @@ def _render_file_ingest() -> None:
 
 
 def _render_text_ingest() -> None:
+    """Render the manual text ingestion form and handle submissions."""
     with st.form("text_ingest_form"):
         title = st.text_input("Document title", value="Manual Entry")
         text_input = st.text_area(
@@ -112,13 +117,14 @@ def _render_text_ingest() -> None:
         st.error("Please enter some text before submitting.")
         return
 
-    with st.spinner("Processing text and querying Gemma…"):
+    with st.spinner("Processing text and querying the LLM…"):
         ingestion_summary = _ingest_from_text(text_input, title)
 
     _render_ingest_summary(ingestion_summary)
 
 
 def _render_ingest_summary(ingestion_summary: Dict[str, Any]) -> None:
+    """Display feedback and stats produced by the ingestion pipeline."""
     st.success("Ingestion complete")
     if ingestion_summary.get("existing_document"):
         st.info("Content was previously ingested; generated a fresh set of candidates.")

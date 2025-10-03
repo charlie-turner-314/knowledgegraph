@@ -11,6 +11,7 @@ from app.services.review_service import ReviewService, serialize_candidate
 
 
 def render() -> None:
+    """Render the SME review queue UI."""
     st.header("SME Review Queue")
     st.write("Approve, reject, or refine candidate triples before they enter the graph.")
 
@@ -34,6 +35,10 @@ def render() -> None:
         expander_col, approve_col, reject_col = st.columns([0.72, 0.14, 0.14])
         with expander_col:
             expander = st.expander(header, expanded=False)
+        candidate_subject_attrs = candidate.get("subject_attributes") or []
+        candidate_object_attrs = candidate.get("object_attributes") or []
+        candidate_tags = candidate.get("tags") or []
+
         if approve_col.button(
             "Approve",
             key=f"quick_approve_{candidate['id']}",
@@ -47,6 +52,9 @@ def render() -> None:
                     "predicate": candidate["predicate"],
                     "object": candidate["object"],
                     "notes": None,
+                    "subject_attributes": candidate_subject_attrs,
+                    "object_attributes": candidate_object_attrs,
+                    "tags": candidate_tags,
                 },
             )
         if reject_col.button(
@@ -89,18 +97,25 @@ def render() -> None:
             object_attr_key = f"object_attrs_{candidate['id']}"
             tag_key = f"tags_{candidate['id']}"
 
+            subject_attr_value = _format_attributes_for_input(candidate_subject_attrs)
+            object_attr_value = _format_attributes_for_input(candidate_object_attrs)
+            tag_value = ", ".join(candidate_tags)
+
             subject_attr_raw = st.text_area(
                 "Subject attributes",
+                value=subject_attr_value,
                 key=subject_attr_key,
                 help="Comma or newline separated key=value pairs. Prefix values with enum:, bool:, or number: to force a type.",
             )
             object_attr_raw = st.text_area(
                 "Object attributes",
+                value=object_attr_value,
                 key=object_attr_key,
                 help="Comma or newline separated key=value pairs. Prefix values with enum:, bool:, or number: to force a type.",
             )
             tag_raw = st.text_input(
                 "Triple tags",
+                value=tag_value,
                 key=tag_key,
                 help="Comma separated tags applied to this triple.",
             )
@@ -143,6 +158,7 @@ def render() -> None:
 
 
 def _load_pending_candidates() -> List[Dict[str, Any]]:
+    """Load pending candidate triples and serialise them for display."""
     with session_scope() as session:
         service = ReviewService(session)
         pending = service.list_pending(limit=25)
@@ -151,6 +167,7 @@ def _load_pending_candidates() -> List[Dict[str, Any]]:
 
 
 def _resolve_candidate(*, action: str, candidate_id: int, payload: Dict[str, Any]) -> None:
+    """Execute reviewer actions and update the review flash state."""
     try:
         with session_scope() as session:
             service = ReviewService(session)
@@ -188,6 +205,7 @@ def _resolve_candidate(*, action: str, candidate_id: int, payload: Dict[str, Any
 
 
 def _parse_attribute_input(raw_value: Optional[str]) -> List[Dict[str, object]]:
+    """Parse human-entered attributes into structured dictionaries."""
     if not raw_value:
         return []
     entries = re.split(r"[\n;,]+", raw_value)
@@ -263,7 +281,47 @@ def _parse_attribute_input(raw_value: Optional[str]) -> List[Dict[str, object]]:
 
 
 def _parse_tags(raw_value: Optional[str]) -> List[str]:
+    """Normalise a comma separated tag string."""
     if not raw_value:
         return []
     tags = [tag.strip().lower() for tag in raw_value.split(",") if tag.strip()]
     return sorted(set(tags))
+
+
+def _format_attributes_for_input(attrs: Optional[List[Dict[str, object]]]) -> str:
+    """Render attribute dictionaries into text suitable for the input textarea."""
+    if not attrs:
+        return ""
+    formatted: List[str] = []
+    for attr in attrs:
+        name = attr.get("name")
+        if not name:
+            continue
+        value = None
+        if attr.get("value_text") is not None:
+            value = attr["value_text"]
+        elif attr.get("value_number") is not None:
+            value = attr["value_number"]
+        elif attr.get("value_boolean") is not None:
+            value = attr["value_boolean"]
+        elif attr.get("value") is not None:
+            value = attr["value"]
+        else:
+            value = ""
+
+        data_type = attr.get("data_type")
+        prefix = ""
+        if isinstance(data_type, NodeAttributeType):
+            dt = data_type.value
+        elif isinstance(data_type, str):
+            dt = data_type
+        else:
+            dt = None
+        if dt == NodeAttributeType.enum.value:
+            prefix = "enum:"
+        elif dt == NodeAttributeType.boolean.value:
+            prefix = "bool:"
+        elif dt == NodeAttributeType.number.value:
+            prefix = "number:"
+        formatted.append(f"{name}={prefix}{value}")
+    return "\n".join(formatted)

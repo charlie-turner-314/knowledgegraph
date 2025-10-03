@@ -13,8 +13,11 @@ class AppSettings(BaseSettings):
 
     app_name: str = Field(default="Knowledge Graph SME Workbench")
     database_path: Path = Field(default_factory=lambda: Path.cwd() / "data" / "knowledge_graph.db")
-    gemma_endpoint: Optional[str] = Field(default=None, alias="GEMMA_ENDPOINT")
-    gemma_api_key: Optional[str] = Field(default=None, alias="GEMMA_API_KEY")
+    llm_endpoint: Optional[str] = Field(default=None, alias="LLM_ENDPOINT")
+    llm_api_key: Optional[str] = Field(default=None, alias="LLM_API_KEY")
+    embedding_endpoint: Optional[str] = Field(default=None, alias="EMBEDDING_ENDPOINT")
+    embedding_api_key: Optional[str] = Field(default=None, alias="EMBEDDING_API_KEY")
+    embedding_deployment: Optional[str] = Field(default=None, alias="EMBEDDING_DEPLOYMENT")
     model_source: str = Field(default="openai", alias="MODEL_SOURCE")
     log_level: str = Field(default="INFO")
 

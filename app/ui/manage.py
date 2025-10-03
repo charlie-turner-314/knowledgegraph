@@ -5,15 +5,19 @@ from typing import Any, Dict, List
 import streamlit as st
 
 from app.data.db import session_scope
-from app.services import AdminService
+from app.services import AdminService, GraphInsightService
 
 
 def render() -> None:
+    """Render the admin dashboard with maintenance, document, and vocabulary tools."""
     st.header("Administration")
     st.caption("Manage canonical vocabulary and uploaded documents.")
 
     _render_flash()
     _render_pending_confirmations()
+
+    st.subheader("Graph Maintenance")
+    _render_graph_scan_section()
 
     st.subheader("Documents")
     _render_documents_section()
@@ -28,6 +32,7 @@ def render() -> None:
 
 
 def _render_flash() -> None:
+    """Display any queued admin flash message."""
     flash = st.session_state.pop("admin_flash", None)
     if not flash:
         return
@@ -42,6 +47,7 @@ def _render_flash() -> None:
 
 
 def _render_pending_confirmations() -> None:
+    """Render confirmation prompts for delete operations when required."""
     if (doc_id := st.session_state.get("admin_confirm_delete_doc")) is not None:
         doc_name = st.session_state.get("admin_confirm_delete_doc_name", "this document")
         with st.warning(
@@ -65,11 +71,132 @@ def _render_pending_confirmations() -> None:
                 _clear_term_confirmation()
 
 
+def _render_graph_scan_section() -> None:
+    """Render the graph maintenance controls and display scan results."""
+    results_key = "admin_graph_scan_results"
+    message_key = "admin_graph_scan_message"
+
+    default_threshold = st.session_state.get("admin_graph_scan_threshold", 0.82)
+    default_top_k = st.session_state.get("admin_graph_scan_top_k", 6)
+    default_max_clusters = st.session_state.get("admin_graph_scan_max_clusters", 10)
+
+    threshold = st.slider(
+        "Similarity threshold",
+        min_value=0.5,
+        max_value=0.95,
+        value=float(default_threshold),
+        step=0.01,
+        help="Minimum cosine similarity required for nodes to be grouped. Lower this if you have sparse data.",
+    )
+    cols = st.columns(2)
+    top_k = int(
+        cols[0].number_input(
+            "Neighbors per node",
+            min_value=2,
+            max_value=25,
+            value=int(default_top_k),
+            step=1,
+            help="How many nearest labels to compare for each node when forming clusters.",
+        )
+    )
+    max_clusters = int(
+        cols[1].number_input(
+            "Max clusters to review",
+            min_value=1,
+            max_value=30,
+            value=int(default_max_clusters),
+            step=1,
+            help="Cap on the number of candidate clusters returned in a single scan.",
+        )
+    )
+
+    scan_button = st.button("Scan and recommend graph connections")
+
+    if scan_button:
+        with st.spinner("Analyzing graph clusters..."):
+            with session_scope() as session:
+                insight_service = GraphInsightService(session)
+                recommendations = insight_service.scan_for_recommendations(
+                    similarity_threshold=float(threshold),
+                    top_k=top_k,
+                    max_clusters=max_clusters,
+                )
+                st.session_state[results_key] = [
+                    {
+                        "node_summaries": item.node_summaries,
+                        "existing_connections": item.existing_connections,
+                        "missing_pairs": item.missing_pairs,
+                        "proposed_nodes": item.proposed_nodes,
+                        "proposed_edges": item.proposed_edges,
+                        "notes": item.notes,
+                    }
+                    for item in recommendations
+                ]
+                st.session_state["admin_graph_scan_threshold"] = float(threshold)
+                st.session_state["admin_graph_scan_top_k"] = top_k
+                st.session_state["admin_graph_scan_max_clusters"] = max_clusters
+                st.session_state[message_key] = (
+                    f"Scan complete: evaluated {len(recommendations)} cluster(s) "
+                    f"(threshold {threshold:.2f}, neighbors {top_k}, max clusters {max_clusters})."
+                )
+        st.rerun()
+
+    if message_key in st.session_state:
+        st.success(st.session_state.pop(message_key))
+
+    results = st.session_state.get(results_key, [])
+    if not results:
+        st.caption("No scan results yet. Click the button above to analyze the graph.")
+        return
+
+    for idx, item in enumerate(results, start=1):
+        with st.expander(f"Cluster recommendation #{idx}", expanded=False):
+            st.write("**Cluster nodes**")
+            for summary in item.get("node_summaries", []):
+                attrs = summary.get("attributes") or []
+                attr_text = ", ".join(
+                    f"{attr['name']}: {attr.get('value')}" for attr in attrs
+                ) if attrs else "(no attributes)"
+                st.write(f"- {summary['label']} — {attr_text}")
+
+            existing = item.get("existing_connections") or []
+            if existing:
+                st.write("**Existing connections**")
+                for edge in existing:
+                    st.write(
+                        f"- {edge['subject']} — {edge['predicate']} — {edge['object']}"
+                    )
+            missing_pairs = item.get("missing_pairs") or []
+            if missing_pairs:
+                st.write("**Unconnected pairs**")
+                for source, target in missing_pairs:
+                    st.write(f"- {source} ↔ {target}")
+
+            proposed_nodes = item.get("proposed_nodes") or []
+            proposed_edges = item.get("proposed_edges") or []
+            if proposed_nodes:
+                st.write("**LLM proposed nodes**")
+                for node in proposed_nodes:
+                    description = node.get("description") or ""
+                    st.write(f"- {node.get('label')} — {description}")
+            if proposed_edges:
+                st.write("**LLM proposed edges**")
+                for edge in proposed_edges:
+                    rationale = edge.get("rationale") or ""
+                    st.write(
+                        f"- {edge.get('subject')} — {edge.get('predicate')} — {edge.get('object')}"
+                        + (f" ({rationale})" if rationale else "")
+                    )
+            if item.get("notes"):
+                st.info(item["notes"])
+
+
 # ---------------------------------------------------------------------------
 # Document management
 
 
 def _render_documents_section() -> None:
+    """List ingested documents with stats and management controls."""
     documents = _load_documents()
     if not documents:
         st.info("No documents ingested yet.")
@@ -89,6 +216,7 @@ def _render_documents_section() -> None:
 
 
 def _load_documents() -> List[Dict[str, Any]]:
+    """Return document metadata dictionaries for the admin view."""
     with session_scope() as session:
         svc = AdminService(session)
         documents = svc.list_documents()
@@ -96,6 +224,7 @@ def _load_documents() -> List[Dict[str, Any]]:
 
 
 def _delete_document(document_id: int) -> None:
+    """Delete the document identified by ``document_id`` and refresh the UI."""
     with session_scope() as session:
         svc = AdminService(session)
         try:
@@ -109,6 +238,7 @@ def _delete_document(document_id: int) -> None:
 
 
 def _clear_doc_confirmation() -> None:
+    """Remove stored confirmation state after cancelling or completing deletion."""
     st.session_state.pop("admin_confirm_delete_doc", None)
     st.session_state.pop("admin_confirm_delete_doc_name", None)
 
@@ -118,6 +248,7 @@ def _clear_doc_confirmation() -> None:
 
 
 def _render_canonical_terms_section() -> None:
+    """Render controls that manage canonical vocabulary entries."""
     with st.expander("Add new canonical term", expanded=False):
         with st.form("add_canonical_term_form"):
             label = st.text_input("Preferred label", key="admin_new_term_label")
@@ -206,6 +337,7 @@ def _render_canonical_terms_section() -> None:
 
 
 def _load_terms() -> List[Dict[str, Any]]:
+    """Fetch canonical terms and return them as plain dictionaries."""
     with session_scope() as session:
         svc = AdminService(session)
         terms = svc.list_canonical_terms()
@@ -213,6 +345,7 @@ def _load_terms() -> List[Dict[str, Any]]:
 
 
 def _add_alias(term_id: int, alias: str) -> None:
+    """Add ``alias`` to ``term_id`` and surface success feedback."""
     with session_scope() as session:
         svc = AdminService(session)
         svc.add_alias(term_id, alias)
@@ -223,6 +356,7 @@ def _add_alias(term_id: int, alias: str) -> None:
 
 
 def _remove_alias(term_id: int, alias: str) -> None:
+    """Remove ``alias`` from ``term_id`` and surface success feedback."""
     with session_scope() as session:
         svc = AdminService(session)
         svc.remove_alias(term_id, alias)
@@ -233,6 +367,7 @@ def _remove_alias(term_id: int, alias: str) -> None:
 
 
 def _render_term_edit_dialog() -> None:
+    """Show a modal for renaming a canonical term when requested."""
     term_id = st.session_state.get("admin_edit_term_id")
     if term_id is None:
         return
@@ -270,6 +405,7 @@ def _render_term_edit_dialog() -> None:
 
 
 def _delete_canonical_term(term_id: int) -> None:
+    """Delete a canonical term and flash the outcome."""
     with session_scope() as session:
         svc = AdminService(session)
         try:
@@ -286,14 +422,15 @@ def _delete_canonical_term(term_id: int) -> None:
 
 
 def _clear_term_confirmation() -> None:
+    """Clear stored confirmation state for canonical term deletion."""
     st.session_state.pop("admin_confirm_delete_term", None)
     st.session_state.pop("admin_confirm_delete_term_label", None)
 
 
 def _clear_term_edit_state() -> None:
+    """Reset modal state after renaming a canonical term."""
     st.session_state.pop("admin_edit_term_id", None)
     st.session_state.pop("admin_edit_term_label", None)
     st.session_state.pop("admin_edit_term_entity", None)
     st.session_state.pop("admin_edit_label_input", None)
     st.session_state.pop("admin_edit_entity_input", None)
-

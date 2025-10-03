@@ -33,4 +33,5 @@ def session_scope() -> Iterator[Session]:
 
 
 def get_engine():
+    """Return the shared SQLModel engine instance."""
     return _engine

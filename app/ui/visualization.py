@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover
 
 
 def render() -> None:
+    """Render the interactive knowledge graph visualisation page."""
     st.header("Knowledge Graph Visualization")
     st.write("Interact with the approved knowledge graph edges and trace their provenance.")
 
@@ -55,6 +56,7 @@ def render() -> None:
 
 
 def _load_documents() -> List[Dict[str, Any]]:
+    """Return available documents for graph filtering."""
     with session_scope() as session:
         rows = session.exec(select(models.Document)).all()
         return [
@@ -64,6 +66,7 @@ def _load_documents() -> List[Dict[str, Any]]:
 
 
 def _load_edges(*, document_ids: List[int]) -> List[Dict[str, Any]]:
+    """Return graph edges optionally filtered by originating documents."""
     from sqlalchemy.orm import selectinload
 
     with session_scope() as session:
@@ -113,6 +116,7 @@ def _load_edges(*, document_ids: List[int]) -> List[Dict[str, Any]]:
 
 
 def _format_edge_tooltip(edge: Dict[str, Any]) -> str:
+    """Build an HTML tooltip string for a given edge."""
     parts = [edge["predicate"]]
     for source in edge.get("sources", []):
         if source["document"]:

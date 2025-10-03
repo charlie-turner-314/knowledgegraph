@@ -16,7 +16,7 @@ from app.data.repositories import (
     OntologySuggestionRepository,
     SMEActionRepository,
 )
-from app.llm.client import GemmaClient, get_client
+from app.llm.client import LLMClient, get_client
 
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,7 @@ _BLOCKING_GUARDRAILS: Set[str] = {"needs_review"}
 
 @dataclass
 class ClusterAnalysis:
+    """Container describing the similarity characteristics of a node cluster."""
     indices: List[int]
     node_ids: List[int]
     labels: List[str]
@@ -36,7 +37,10 @@ class ClusterAnalysis:
 
 
 class OntologyInferenceService:
-    def __init__(self, session: Session, *, llm_client: Optional[GemmaClient] = None):
+    """Identify clusters of similar nodes and propose ontology refinements."""
+
+    def __init__(self, session: Session, *, llm_client: Optional[LLMClient] = None):
+        """Prepare repositories, embeddings, and LLM client for inference."""
         self.session = session
         self.graph = GraphRepository(session)
         self.actions = SMEActionRepository(session)
@@ -57,6 +61,7 @@ class OntologyInferenceService:
         limit: Optional[int] = None,
         created_by: str = "ontology_inference",
     ) -> List[models.OntologySuggestion]:
+        """Analyse similarity clusters and store LLM-backed ontology suggestions."""
         nodes: List[models.Node] = [
             node for node in self.session.exec(select(models.Node)) if node.label
         ]
@@ -194,6 +199,7 @@ class OntologyInferenceService:
         actor: Optional[str] = None,
         enforce_guardrails: bool = True,
     ) -> models.OntologySuggestion:
+        """Materialise a pending suggestion as new edges."""
         suggestion = self.suggestions.get(suggestion_id)
         if suggestion is None:
             raise ValueError("Suggestion not found")
@@ -268,6 +274,7 @@ class OntologyInferenceService:
         actor: Optional[str] = None,
         reason: Optional[str] = None,
     ) -> models.OntologySuggestion:
+        """Mark a suggestion as rejected and record the reason."""
         suggestion = self.suggestions.get(suggestion_id)
         if suggestion is None:
             raise ValueError("Suggestion not found")
@@ -296,6 +303,7 @@ class OntologyInferenceService:
     def _build_similarity_matrix(
         self, labels: Sequence[str]
     ) -> tuple[np.ndarray, str]:
+        """Return a label similarity matrix and the backend used."""
         embeddings = self.embedding_store.encode_labels(labels)
         if embeddings is not None and embeddings.size:
             similarity = embeddings @ embeddings.T
@@ -315,6 +323,7 @@ class OntologyInferenceService:
         threshold: float,
         min_cluster_size: int,
     ) -> List[List[int]]:
+        """Return connected components of indices above the similarity threshold."""
         n = similarity.shape[0]
         visited: Set[int] = set()
         clusters: List[List[int]] = []
@@ -343,6 +352,7 @@ class OntologyInferenceService:
         similarity: np.ndarray,
         backend: str,
     ) -> ClusterAnalysis:
+        """Compute statistics describing a cluster for downstream scoring."""
         pair_scores = [
             float(similarity[i, j])
             for i, j in combinations(indices, 2)
@@ -369,6 +379,7 @@ class OntologyInferenceService:
 
     @staticmethod
     def _shared_parents(parent_sets: Sequence[Set[int]]) -> Set[int]:
+        """Return node IDs that appear as parents across every set."""
         filtered = [parents for parents in parent_sets if parents]
         if not filtered:
             return set()
@@ -383,6 +394,7 @@ class OntologyInferenceService:
         embedding_component: float,
         llm_component: Optional[float],
     ) -> float:
+        """Combine embedding similarity and LLM confidence into a single score."""
         embedding_component = max(0.0, min(1.0, embedding_component))
         if llm_component is None:
             return round(embedding_component, 3)
@@ -391,6 +403,7 @@ class OntologyInferenceService:
         return round(min(1.0, blended), 3)
 
     def _edge_exists(self, subject_id: int, object_id: int, predicate: str) -> bool:
+        """Return ``True`` if an edge already connects ``subject_id`` to ``object_id``."""
         statement = (
             select(models.Edge)
             .where(models.Edge.subject_node_id == subject_id)

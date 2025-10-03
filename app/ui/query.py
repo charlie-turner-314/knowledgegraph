@@ -7,6 +7,7 @@ from app.services import QueryResult, QueryService
 
 
 def render() -> None:
+    """Render the natural language query chat interface."""
     st.header("Natural Language Query")
     st.write("Ask questions about the curated knowledge graph. An LLM now plans traversals and falls back to keyword search only when needed.")
 
@@ -44,6 +45,7 @@ def render() -> None:
 
 
 def _format_query_result(result: QueryResult) -> str:
+    """Convert a ``QueryResult`` into markdown for chat history display."""
     lines = []
     if result.answers:
         lines.extend(result.answers)

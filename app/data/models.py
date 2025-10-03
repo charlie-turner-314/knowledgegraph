@@ -133,6 +133,9 @@ class CandidateTriple(SQLModel, table=True):
         foreign_key="candidate_triples.id",
     )
     is_potential_duplicate: bool = Field(default=False, nullable=False)
+    subject_attributes: List[dict] = Field(default_factory=list, sa_column=Column(SQLiteJSON))
+    object_attributes: List[dict] = Field(default_factory=list, sa_column=Column(SQLiteJSON))
+    suggested_tags: List[str] = Field(default_factory=list, sa_column=Column(SQLiteJSON))
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
     updated_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
