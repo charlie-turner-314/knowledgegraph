@@ -134,9 +134,6 @@ class LLMClient:
             else:
                 headers["Authorization"] = f"Bearer {self.api_key}"
         response = requests.post(self.endpoint, headers=headers, data=orjson.dumps(payload))
-        print(response.status_code)
-        print(response.json())
-        exit()
         response.raise_for_status()
         return response.json()
 
