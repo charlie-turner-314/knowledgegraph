@@ -163,7 +163,9 @@ class LLMClient:
                 headers["api-key"] = f"{self.api_key}"
             else:
                 headers["Authorization"] = f"Bearer {self.api_key}"
+        logger.info("Calling LLM endpoint %s", self.endpoint)
         response = requests.post(self.endpoint, headers=headers, data=orjson.dumps(payload))
+        logger.info("Received response with status %s", response.status_code)
         response.raise_for_status()
         return response.json()
 
@@ -300,7 +302,7 @@ class LLMClient:
 
         request_payload: Dict[str, Any] = {
             "messages": messages,
-            "temperature": settings.temperature,
+            "temperature": settings.llm_temperature_connections,
             "response_format": {"type": "json_object"},
         }
 

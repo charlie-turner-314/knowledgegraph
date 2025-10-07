@@ -10,11 +10,19 @@ from app.core.config import settings
 
 _engine = create_engine(settings.database_url, echo=False, future=True)
 
+# Prevent repeated metadata registration during Streamlit reruns
+_db_initialized = False
+
 
 def init_db() -> None:
     """Create all database tables; call during app bootstrap."""
 
+    global _db_initialized
+    if _db_initialized:
+        return
+
     SQLModel.metadata.create_all(_engine)
+    _db_initialized = True
 
 
 @contextmanager

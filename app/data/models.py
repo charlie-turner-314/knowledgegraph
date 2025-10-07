@@ -55,6 +55,7 @@ class OntologySuggestionStatus(str, enum.Enum):
 
 class Document(SQLModel, table=True):
     __tablename__ = "documents"
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     display_name: str = Field(index=True)
@@ -69,6 +70,7 @@ class Document(SQLModel, table=True):
 
 class DocumentChunk(SQLModel, table=True):
     __tablename__ = "document_chunks"
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     document_id: int = Field(foreign_key="documents.id", nullable=False, index=True)
@@ -84,6 +86,7 @@ class DocumentChunk(SQLModel, table=True):
 
 class CanonicalTerm(SQLModel, table=True):
     __tablename__ = "canonical_terms"
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     label: str = Field(index=True)
@@ -99,6 +102,7 @@ class CanonicalTerm(SQLModel, table=True):
 
 class Node(SQLModel, table=True):
     __tablename__ = "nodes"
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     label: str = Field(index=True)
@@ -124,6 +128,7 @@ class Node(SQLModel, table=True):
 
 class CandidateTriple(SQLModel, table=True):
     __tablename__ = "candidate_triples"
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     chunk_id: int = Field(foreign_key="document_chunks.id", nullable=False, index=True)
@@ -154,6 +159,7 @@ class CandidateTriple(SQLModel, table=True):
 
 class Edge(SQLModel, table=True):
     __tablename__ = "edges"
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     subject_node_id: int = Field(foreign_key="nodes.id", nullable=False, index=True)
@@ -181,6 +187,7 @@ class EdgeSource(SQLModel, table=True):
             "(source_type='document_chunk' AND document_chunk_id IS NOT NULL) OR (source_type='sme_note' AND sme_action_id IS NOT NULL)",
             name="edge_source_valid_reference",
         ),
+        {"extend_existing": True},
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -198,6 +205,7 @@ class EdgeSource(SQLModel, table=True):
 
 class SMEAction(SQLModel, table=True):
     __tablename__ = "sme_actions"
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     action_type: SMEActionType = Field(nullable=False, index=True)
@@ -212,6 +220,7 @@ class SMEAction(SQLModel, table=True):
 
 class GraphStatement(SQLModel, table=True):
     __tablename__ = "graph_statements"
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     subject_node_id: Optional[int] = Field(foreign_key="nodes.id", index=True)
@@ -246,6 +255,7 @@ class NodeAttribute(SQLModel, table=True):
             name="node_attribute_valid_type",
         ),
         UniqueConstraint("node_id", "name", name="uq_node_attribute_node_name"),
+        {"extend_existing": True},
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -263,6 +273,7 @@ class NodeAttribute(SQLModel, table=True):
 
 class EdgeTag(SQLModel, table=True):
     __tablename__ = "edge_tags"
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     edge_id: int = Field(foreign_key="edges.id", nullable=False, index=True)
@@ -274,6 +285,7 @@ class EdgeTag(SQLModel, table=True):
 
 class OntologySuggestion(SQLModel, table=True):
     __tablename__ = "ontology_suggestions"
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     parent_label: str = Field(nullable=False, index=True)

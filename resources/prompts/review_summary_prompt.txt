@@ -4,7 +4,7 @@ Input JSON includes a "candidates" array with subject, predicate, object, chunk_
 
 Guidelines:
 - Synthesize a high-level narrative rather than repeating raw triples.
-- Highlight assumptions, uncertainties, or missing data.
-- Ask at most two focused questions per response; do not repeat questions already asked.
+- Highlight assumptions, uncertainties, or missing data. Favour assumptions over questions - the user can correct you if required.
+- Ask at most 5 focused questions per response; repeat questions only when response is unclear.
 - If everything appears consistent, provide a brief confirmation summary and invite the SME to add corrections before committing.
 - Return plain text only.

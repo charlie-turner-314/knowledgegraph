@@ -85,6 +85,11 @@ def _render_collaborative_conversation(candidates: List[Dict[str, Any]]) -> None
     history: List[Dict[str, str]] = st.session_state.setdefault("collab_history", [])
     summary_cache: Optional[str] = st.session_state.get("collab_summary")
 
+    # Persist the current candidates so callbacks (which run in a different
+    # execution context) can access the selected/focus candidate when
+    # generating iterative assistant replies.
+    st.session_state["_collab_candidates"] = candidates
+
     if history:
         for message in history:
             with st.chat_message(message["role"]):
@@ -93,7 +98,7 @@ def _render_collaborative_conversation(candidates: List[Dict[str, Any]]) -> None
         st.info("Start by requesting a summary of what the assistant learned from the uploaded materials.")
 
     cols = st.columns(2)
-    if cols[0].button("Generate summary & questions", key="collab_generate"):
+    if cols[0].button("Start conversation", key="collab_generate"):
         message = _generate_review_summary(candidates, history)
         history.append({"role": "assistant", "content": message})
         st.session_state["collab_history"] = history
@@ -106,32 +111,86 @@ def _render_collaborative_conversation(candidates: List[Dict[str, Any]]) -> None
         st.session_state.pop("collab_summary", None)
         st.rerun()
 
-    user_input = st.text_area("Your response", key="collab_input")
-    if st.button("Send", key="collab_send"):
-        if user_input.strip():
-            history.append({"role": "user", "content": user_input.strip()})
-            st.session_state["collab_history"] = history
+    # Ensure collab_input is present before rendering the widget
+    if "collab_input" not in st.session_state:
+        st.session_state["collab_input"] = ""
+
+    # Clear any previous empty-input warning
+    st.session_state.pop("collab_warning", None)
+
+    def _collab_send_callback() -> None:
+        """Callback invoked by the Send button. Updates history and clears the input.
+
+        This runs inside Streamlit's callback context so modifying
+        st.session_state["collab_input"] is allowed.
+        """
+        user_input = st.session_state.get("collab_input", "")
+        if user_input and user_input.strip():
+            hist = st.session_state.get("collab_history", [])
+            hist.append({"role": "user", "content": user_input.strip()})
+            st.session_state["collab_history"] = hist
+            # Clear the widget value via session_state from inside the callback
             st.session_state["collab_input"] = ""
-            st.rerun()
+
+            # Generate an iterative assistant reply so the flow behaves like a chat.
+            try:
+                client = get_client()
+                # Choose a focus candidate: prefer the first one if available
+                candidates = st.session_state.get("_collab_candidates") or []
+                candidate_payload = candidates[0] if candidates else {}
+                # Pass the already-updated history to the LLM so it can respond iteratively
+                assistant_reply = client.generate_validation_question(
+                    candidate_payload=candidate_payload, history=st.session_state.get("collab_history", [])
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Record a flash error and fall back to a simple assistant prompt
+                st.session_state["review_flash"] = {"type": "error", "message": str(exc)}
+                assistant_reply = "I couldn't reach the assistant; please try again later."
+
+            # Append assistant reply to history
+            hist = st.session_state.get("collab_history", [])
+            hist.append({"role": "assistant", "content": assistant_reply})
+            st.session_state["collab_history"] = hist
         else:
-            st.warning("Please enter a response before sending.")
+            # Set a flag which we will render after the callback
+            st.session_state["collab_warning"] = True
+
+    user_input = st.text_area("Your response", key="collab_input")
+    st.button("Send", key="collab_send", on_click=_collab_send_callback)
+
+    # Show warning if callback flagged empty input
+    if st.session_state.pop("collab_warning", False):
+        st.warning("Please enter a response before sending.")
 
     summary = summary_cache or _conversation_summary(history)
     if summary:
         st.caption("Working summary (will be stored when committed):")
         st.write(summary)
 
-    action_cols = st.columns([0.4, 0.4, 0.2])
-    if action_cols[0].button("Commit to knowledge graph", key="collab_commit"):
+    action_cols = st.columns([0.3, 0.3, 0.3, 0.1])
+    if action_cols[0].button("Generate overall summary", key="collab_generatesummary"):
+        # Clear the current summary immediately
+        st.session_state["collab_summary"] = ""
+        # Show a spinner while the LLM request is in progress
+        with st.spinner("Generating summary..."):
+            summary = _generate_review_summary(candidates, history)
+        # Update session state with the new summary
+        st.session_state["collab_summary"] = summary
+        st.session_state["collab_history"] = history
+        # Force UI refresh to show the new summary
+        st.rerun()
+
+    if action_cols[1].button("Commit to knowledge graph", key="collab_commit"):
         _finalize_candidates(candidates, summary)
-    if action_cols[1].button("Mark as needs evidence", key="collab_needevidence"):
+    if action_cols[2].button("Mark as needs evidence", key="collab_needevidence"):
         _mark_conversation_needs_evidence(candidates, summary)
-    with action_cols[2]:
+    with action_cols[3]:
         st.caption("Conversation state stored automatically.")
 
 
 def _generate_review_summary(
-    candidates: List[Dict[str, Any]], history: List[Dict[str, str]]
+    candidates: List[Dict[str, Any]], history: List[Dict[str, str]],
+    allow_questions: bool=True,
 ) -> str:
     client = get_client()
     payload = [
@@ -149,7 +208,7 @@ def _generate_review_summary(
     return client.generate_review_summary(candidates=payload, history=history)
 
 
-def _conversation_summary(history: List[Dict[str, str]]) -> str:
+def _conversation_summary(history: List[Dict[str, str]], allow_questions: bool=True) -> str:
     if not history:
         return ""
     lines = [f"{message['role']}: {message['content']}" for message in history]
