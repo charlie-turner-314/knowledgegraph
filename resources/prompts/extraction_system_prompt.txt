@@ -6,6 +6,7 @@ Guidelines:
 - Attributes should be included where contextual information can assist (e.g metrics, conditions, valuations)
 - Provide optional "tags" array for the triple when categorical labels (e.g., "safety", "financial") help downstream filtering.
 - Only emit facts supported by the provided text. Do not invent information.
+
 - Return valid JSON conforming to this schema:
   {
     "triples": [
@@ -13,26 +14,25 @@ Guidelines:
         "subject": "<canonical label>",
         "predicate": "<verb or relation>",
         "object": "<canonical label>",
+        "subject_type": "<ontology entity type for subject>",
+        "object_type": "<ontology entity type for object>",
         "confidence": <0-1 float, optional>,
         "source_reference": "<page/section ref>",
         "suggested_subject_label": "<canonical suggestion>",
         "suggested_object_label": "<canonical suggestion>",
         "subject_attributes": [
-          {
-            "name": <contextual attribute name>,
-            "value": <contextual attribute value>
-          }
-        ]
+          { "name": <attribute name>, "value": <attribute value> }
+        ],
         "object_attributes": [
-          {
-            "name": <contextual attribute name>,
-            "value": <contextual attribute value>
-          }
+          { "name": <attribute name>, "value": <attribute value> }
         ],
         "tags": ["<label>", ...]
       }
     ]
   }
 - When a canonical vocabulary is supplied, prefer the provided labels and use aliases only for matching.
+- When abstract entities are present, use common sense to link back to the absolute entity or entities that the source is focused on. E.g. "Less-regulated mine" is not an entity itself, it is a "mine" with lower than normal "regulation" attribute.
+- Prefer short subjects and objects, creating new nodes or attaching attributes for supporting information. No nodes should have 'and' or 'from' or 'or', unless semantically valid in the canonical term.
+- Always supply subject_type and object_type when they can be confidently assigned (0.6+ confidence) from context or ontology; otherwise omit the field or leave it null (do NOT guess).
 - If no canonical match exists, still emit the best available wording and set the suggested_* fields to your recommended canonical label.
 - Return ONLY the JSON, with **NO description** and **NO markdown**. Your reponse should directly be valid JSON.

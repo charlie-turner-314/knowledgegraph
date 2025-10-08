@@ -13,20 +13,23 @@ from tenacity import RetryError, retry, stop_after_attempt, wait_random_exponent
 from app.core.config import settings
 
 from .schemas import (
+    ConnectionRecommendationResponse,
+    ExtractionContextUpdate,
     ExtractionResponse,
     OntologyParentSuggestion,
     OntologySuggestionResponse,
-    ConnectionRecommendationResponse,
     QueryAnswerResponse,
     QueryPlanResponse,
     QueryRetrievalResponse,
+    ReviewAgentResponse,
     RetrievalNode,
 )
 
 logger = logging.getLogger(__name__)
 
-PROMPT_PATH = (
-    Path(__file__).resolve().parents[2] / "resources" / "prompts" / "extraction_system_prompt.txt"
+PROMPT_PATH = Path(__file__).resolve().parents[2] / "resources" / "prompts" / "extraction_system_prompt.txt"
+EXTRACTION_SUMMARY_PROMPT_PATH = (
+    Path(__file__).resolve().parents[2] / "resources" / "prompts" / "extraction_summary_prompt.txt"
 )
 ONTOLOGY_PROMPT_PATH = (
     Path(__file__).resolve().parents[2] / "resources" / "prompts" / "ontology_parent_prompt.txt"
@@ -48,6 +51,9 @@ CANDIDATE_VALIDATION_PROMPT_PATH = (
 )
 REVIEW_SUMMARY_PROMPT_PATH = (
     Path(__file__).resolve().parents[2] / "resources" / "prompts" / "review_summary_prompt.txt"
+)
+REVIEW_AGENT_PROMPT_PATH = (
+    Path(__file__).resolve().parents[2] / "resources" / "prompts" / "review_agent_prompt.txt"
 )
 
 
@@ -144,6 +150,35 @@ def _load_review_summary_prompt() -> str:
         return "Summarize the candidate information and ask for clarifications if needed."
 
 
+@functools.lru_cache(maxsize=1)
+def _load_review_agent_prompt() -> str:
+    try:
+        return REVIEW_AGENT_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.warning(
+            "Review agent prompt file %s missing; using fallback text",
+            REVIEW_AGENT_PROMPT_PATH,
+        )
+        return (
+            "You are a knowledge graph co-pilot. Respond with JSON containing a 'reply' string "
+            "and a 'commands' list describing graph mutations to perform."
+        )
+
+
+@functools.lru_cache(maxsize=1)
+def _load_extraction_summary_prompt() -> str:
+    try:
+        return EXTRACTION_SUMMARY_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.warning(
+            "Extraction summary prompt file %s missing; using fallback text",
+            EXTRACTION_SUMMARY_PROMPT_PATH,
+        )
+        return (
+            "Maintain a concise running summary and entity list for the document. "
+            "Respond with JSON containing 'summary' and 'entities'."
+        )
+
 class LLMClient:
     """Lightweight client for a chat-completions style LLM endpoint."""
 
@@ -175,22 +210,38 @@ class LLMClient:
         chunk_text: str,
         metadata: Optional[Dict[str, Any]] = None,
         canonical_context: Optional[List[Dict[str, Any]]] = None,
+        predefined_ontology: Optional[Dict[str, Any]] = None,  # Added predefined ontology
+    running_summary: Optional[str] = None,
+    entity_memory: Optional[List[Dict[str, Any]]] = None,
     ) -> ExtractionResponse:
         """Call the configured LLM to extract triples from text."""
 
-        if self._dry_run:
-            logger.warning("LLM endpoint not configured; returning stubbed triple response")
-            stub = ExtractionResponse(
-                triples=[],
-                raw_response={"error": "llm_endpoint_not_configured"},
-            )
-            return stub
+        if predefined_ontology is None:
+            # Load the ontology from the JSON file if not provided
+            ontology_path = Path(__file__).resolve().parents[2] / "resources" / "ontology" / "tad_ontology.json"
+            predefined_ontology = orjson.loads(ontology_path.read_text(encoding="utf-8"))
+
+        # Ensure predefined_ontology is a dictionary
+        predefined_ontology = predefined_ontology or {}
 
         system_prompt = _load_system_prompt()
+        ontology_payload = {
+            "entities": predefined_ontology.get("entities", []),
+            "relationships": predefined_ontology.get("relationships", []),
+        }
+
         messages: List[Dict[str, str]] = [
             {
                 "role": "system",
                 "content": system_prompt,
+            },
+            {
+                "role": "system",
+                "content": (
+                    "The following ontology defines valid entities and relationships. "
+                    "If an entity or relationship does not fit, propose an extension flagged as 'for-review'.\n"
+                    f"Ontology: {orjson.dumps(ontology_payload).decode()}"
+                ),
             },
         ]
 
@@ -202,6 +253,29 @@ class LLMClient:
                     "content": (
                         "Canonical vocabulary for this project (JSON). Use labels when aliases match.\n"
                         f"{orjson.dumps(canonical_payload).decode()}"
+                    ),
+                }
+            )
+
+        if running_summary:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Condensed document summary carried over from earlier sections:\n"
+                        f"{running_summary}"
+                    ),
+                }
+            )
+
+        if entity_memory:
+            entity_payload = {"entity_memory": entity_memory[:40]}
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Previously identified entities (JSON). Use these labels or aliases when context matches.\n"
+                        f"{orjson.dumps(entity_payload).decode()}"
                     ),
                 }
             )
@@ -246,17 +320,100 @@ class LLMClient:
                 parsed_content = message_content
             else:
                 parsed_content = {}
+
+            # Validate against predefined ontology
+            triples = parsed_content.get("triples", [])
+            for triple in triples:
+                subject, predicate, obj = triple["subject"], triple["predicate"], triple["object"]
+                if predefined_ontology and not self._fits_ontology(subject, predicate, obj, predefined_ontology):
+                    triple["review_status"] = "for-review"
+                else:
+                    triple["review_status"] = "approved"
+
             parsed = ExtractionResponse.model_validate(
                 {
-                    "triples": parsed_content.get("triples", []),
+                    "triples": triples,
                     "raw_response": raw,
                 }
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to parse LLM extraction response")
-            raise RuntimeError("Invalid response from LLM extraction endpoint") from exc
+            with open(".llm_extraction_error.json", "wb") as f:
+                f.write(orjson.dumps(raw or {}, option=orjson.OPT_INDENT_2))
+            raise RuntimeError("Invalid response from LLM extraction endpoint. Output saved to .llm_extraction_error.json") from exc
 
         return parsed
+
+    def update_extraction_context(
+        self,
+        *,
+        document_title: str,
+        previous_summary: str,
+        existing_entities: List[Dict[str, Any]],
+        chunk_order: int,
+        chunk_page_label: Optional[str],
+        chunk_text: str,
+        extracted_triples: List[Dict[str, Any]],
+    ) -> ExtractionContextUpdate:
+        if self._dry_run:
+            return ExtractionContextUpdate(
+                summary=previous_summary or f"Document: {document_title}.",
+                entities=[],
+                raw_response={"error": "llm_endpoint_not_configured"},
+            )
+
+        summary_prompt = _load_extraction_summary_prompt()
+        payload = {
+            "document_title": document_title,
+            "previous_summary": previous_summary,
+            "existing_entities": existing_entities,
+            "chunk": {
+                "order": chunk_order,
+                "page_label": chunk_page_label,
+                "text": chunk_text,
+            },
+            "extracted_triples": extracted_triples[:30],
+        }
+
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": summary_prompt},
+            {"role": "user", "content": orjson.dumps(payload).decode()},
+        ]
+
+        request_payload: Dict[str, Any] = {
+            "messages": messages,
+            "temperature": settings.llm_temperature_extraction,
+            "response_format": {"type": "json_object"},
+        }
+
+        raw = self._call_api(request_payload)
+        message_content = raw.get("choices", [{}])[0].get("message", {}).get("content", {})
+        if isinstance(message_content, str):
+            parsed_content = orjson.loads(message_content)
+        elif isinstance(message_content, dict):
+            parsed_content = message_content
+        else:
+            parsed_content = {}
+
+        update = ExtractionContextUpdate.model_validate(
+            {
+                "summary": parsed_content.get("summary") or previous_summary,
+                "entities": parsed_content.get("entities", []),
+                "raw_response": raw,
+            }
+        )
+        return update
+
+    def _fits_ontology(self, subject: str, predicate: str, obj: str, ontology: Dict[str, Any]) -> bool:
+        """Check if a triple fits into the predefined ontology."""
+        # Example logic: Check if subject and object exist in ontology and predicate is valid
+        if subject not in ontology.get("entities", []):
+            return False
+        if obj not in ontology.get("entities", []):
+            return False
+        if predicate not in ontology.get("relationships", []):
+            return False
+        return True
 
     def suggest_parent_node(
         self,
@@ -590,6 +747,73 @@ class LLMClient:
         if isinstance(message_content, dict):
             return orjson.dumps(message_content).decode()
         return "I’m ready when you are to confirm or provide corrections."
+
+    def review_chat(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        graph_context: Dict[str, Any],
+    ) -> ReviewAgentResponse:
+        if self._dry_run:
+            return ReviewAgentResponse(
+                reply="LLM endpoint not configured; no changes applied.",
+                commands=[],
+                raw_response={"error": "llm_endpoint_not_configured"},
+            )
+
+        system_prompt = _load_review_agent_prompt()
+        context_payload = orjson.dumps(graph_context or {}).decode()
+        conversation: List[Dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "system",
+                "content": (
+                    "Graph context in JSON for grounding. Use conservatively and confirm before mutations.\n"
+                    f"{context_payload}"
+                ),
+            },
+        ]
+
+        for item in messages[-12:]:
+            role = item.get("role", "user")
+            content = str(item.get("content", ""))
+            if not content:
+                continue
+            conversation.append({"role": role, "content": content})
+
+        request_payload = {
+            "messages": conversation,
+            "temperature": settings.llm_temperature_review,
+            "response_format": {"type": "json_object"},
+        }
+
+        raw = self._call_api(request_payload)
+        message_content = raw.get("choices", [{}])[0].get("message", {}).get("content", {})
+        if isinstance(message_content, str):
+            try:
+                parsed_content = orjson.loads(message_content)
+            except orjson.JSONDecodeError:
+                parsed_content = {"reply": message_content}
+        elif isinstance(message_content, dict):
+            parsed_content = message_content
+        else:
+            parsed_content = {}
+
+        payload = {
+            "reply": parsed_content.get("reply", "I could not produce a response."),
+            "commands": parsed_content.get("commands", []),
+            "raw_response": raw,
+        }
+
+        try:
+            return ReviewAgentResponse.model_validate(payload)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to parse review chat response; returning fallback reply")
+            return ReviewAgentResponse(
+                reply=str(parsed_content) if parsed_content else "I'm not sure how to help with that.",
+                commands=[],
+                raw_response=raw,
+            )
 
 
 def get_client() -> LLMClient:

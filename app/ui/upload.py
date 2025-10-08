@@ -15,7 +15,7 @@ def render() -> None:
     st.header("Document Ingestion")
     st.write(
         "Provide knowledge via document upload or pasted text. "
-        "All information remains local until approved by the SME."
+        "Extracted statements are written to the knowledge graph immediately with provenance back to the source document."
     )
 
     mode = st.radio(
@@ -47,6 +47,7 @@ def _ingest_from_path(path: Path) -> Dict[str, Any]:
                 "chunks": len(result.chunks),
             },
             "candidates": len(result.candidate_triples),
+            "edges": len(result.edges),
             "duplicates": duplicate_count,
             "existing_document": result.was_existing_document,
         }
@@ -69,6 +70,7 @@ def _ingest_from_text(text: str, title: str) -> Dict[str, Any]:
                 "chunks": len(result.chunks),
             },
             "candidates": len(result.candidate_triples),
+            "edges": len(result.edges),
             "duplicates": duplicate_count,
             "existing_document": result.was_existing_document,
         }
@@ -78,25 +80,58 @@ def _ingest_from_text(text: str, title: str) -> Dict[str, Any]:
 def _render_file_ingest() -> None:
     """Render the file upload form and handle submissions."""
     with st.form("file_ingest_form"):
-        uploaded_file = st.file_uploader(
-            "Select a document",
+        uploaded_files = st.file_uploader(
+            "Select one or more documents",
             type=["pdf", "docx", "pptx", "txt", "md"],
-            accept_multiple_files=False,
+            accept_multiple_files=True,
+            help="You can drag-and-drop multiple files here.",
         )
         submitted = st.form_submit_button("Extract candidate triples")
 
     if not submitted:
         return
 
-    if uploaded_file is None:
-        st.error("Please select a file before submitting.")
+    if not uploaded_files:
+        st.error("Please select at least one file before submitting.")
         return
 
-    with st.spinner("Parsing document and querying the LLM…"):
-        stored_path = store_uploaded_file(uploaded_file.name, uploaded_file)
-        ingestion_summary = _ingest_from_path(stored_path)
+    progress = st.progress(0, text="Starting ingestion…")
+    summaries = []
+    total = len(uploaded_files)
+    for idx, file in enumerate(uploaded_files, 1):
+        progress.progress((idx - 0.5) / total, text=f"Processing {file.name} ({idx}/{total})…")
+        try:
+            stored_path = store_uploaded_file(file.name, file)
+            summary = _ingest_from_path(stored_path)
+            summaries.append((file.name, summary))
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Failed to ingest {file.name}: {exc}")
+        progress.progress(idx / total, text=f"Completed {file.name} ({idx}/{total})")
+    progress.empty()
 
-    _render_ingest_summary(ingestion_summary)
+    if not summaries:
+        st.error("No documents were successfully ingested.")
+        return
+
+    # Aggregate metrics
+    total_candidates = sum(s[1].get("candidates", 0) for s in summaries)
+    total_edges = sum(s[1].get("edges", 0) for s in summaries)
+    total_duplicates = sum(s[1].get("duplicates", 0) for s in summaries)
+    existing_count = sum(1 for s in summaries if s[1].get("existing_document"))
+
+    st.success(f"Ingestion complete — {len(summaries)} document(s) processed.")
+    if existing_count:
+        st.info(f"{existing_count} document(s) were previously ingested; new statements reconciled.")
+
+    agg_cols = st.columns(3)
+    agg_cols[0].metric("Candidate triples analysed", total_candidates)
+    agg_cols[1].metric("Graph statements created", total_edges)
+    agg_cols[2].metric("Potential duplicates skipped", total_duplicates)
+
+    st.markdown("### Per-document results")
+    for name, summary in summaries:
+        with st.expander(f"{name} (ID: {summary['document']['id']})"):
+            _render_ingest_summary(summary)
 
 
 def _render_text_ingest() -> None:
@@ -125,12 +160,14 @@ def _render_text_ingest() -> None:
 
 def _render_ingest_summary(ingestion_summary: Dict[str, Any]) -> None:
     """Display feedback and stats produced by the ingestion pipeline."""
-    st.success("Ingestion complete")
+    # This helper is now used both for single and multi ingest; avoid repeating high-level banners.
     if ingestion_summary.get("existing_document"):
-        st.info("Content was previously ingested; generated a fresh set of candidates.")
+        st.caption("Previously ingested — reconciled with existing graph.")
+
+    metrics = st.columns(3)
+    metrics[0].metric("Candidates", ingestion_summary.get("candidates", 0))
+    metrics[1].metric("Edges", ingestion_summary.get("edges", 0))
+    metrics[2].metric("Chunks", ingestion_summary.get("document", {}).get("chunks", 0))
     duplicate_count = ingestion_summary.get("duplicates", 0)
     if duplicate_count:
-        st.warning(
-            f"{duplicate_count} potential duplicate triple(s) detected. Review tab has them highlighted."
-        )
-    st.json(ingestion_summary)
+        st.warning(f"Skipped {duplicate_count} potential duplicate triple(s).")

@@ -9,7 +9,7 @@ from app.services import QueryResult, QueryService
 def render() -> None:
     """Render the natural language query chat interface."""
     st.header("Natural Language Query")
-    st.write("Ask questions about the curated knowledge graph. An LLM now plans traversals and falls back to keyword search only when needed.")
+    st.write("Ask questions about the curated knowledge graph. Try: 'What equipment is used in mine ventilation?' or 'What are the main risks associated with the Boltec'")
 
     if "query_history" not in st.session_state:
         st.session_state["query_history"] = []
@@ -44,38 +44,43 @@ def render() -> None:
     st.rerun()
 
 
+
+
+
 def _format_query_result(result: QueryResult) -> str:
-    """Convert a ``QueryResult`` into markdown for chat history display."""
-    lines = []
+    """Render a QueryResult using Streamlit widgets for proper formatting, and return a summary for chat history."""
+    summary_lines = []
     if result.answers:
-        lines.extend(result.answers)
+        for answer in result.answers:
+            st.markdown(answer)
+        summary_lines.extend(result.answers)
+    else:
+        st.info("No direct answers found, raw response:")
+        st.json(result)
+        summary_lines.append("No direct answers found. See sources below.")
     if result.matches:
-        lines.append("\n**Supporting triples:**")
+        st.markdown("**Sources:**")
+        seen = {}
         for match in result.matches:
-            doc_part = f" — {match.source_document}" if match.source_document else ""
-            page_part = f" (page {match.page_label})" if match.page_label else ""
-            edge_part = f" [edge #{match.edge_id}]" if match.edge_id is not None else ""
-            meta_parts = []
-            if match.tags:
-                meta_parts.append(f"tags: {', '.join(match.tags)}")
-            if match.subject_attributes:
-                meta_parts.append(
-                    "subject attrs: "
-                    + ", ".join(
-                        f"{key}={value}" for key, value in match.subject_attributes.items()
-                    )
-                )
-            if match.object_attributes:
-                meta_parts.append(
-                    "object attrs: "
-                    + ", ".join(
-                        f"{key}={value}" for key, value in match.object_attributes.items()
-                    )
-                )
-            meta_part = f" ({'; '.join(meta_parts)})" if meta_parts else ""
-            lines.append(
-                f"• {match.subject} — {match.predicate} — {match.object}{doc_part}{page_part}{edge_part}{meta_part}"
-            )
+            doc_title = match.source_document or "(unknown document)"
+            page = match.page_label or ""
+            raw_text = match.raw_text or "(no raw text available)"
+            key = (doc_title, page, raw_text)
+            if key not in seen:
+                seen[key] = []
+            seen[key].append(match)
+        for idx, ((doc_title, page, raw_text), matches) in enumerate(seen.items(), 1):
+            page_str = f" (page {page})" if page else ""
+            badge_label = f"{doc_title}{page_str}"
+            fact_summaries = [f"{m.subject} — {m.predicate} — {m.object}" for m in matches]
+            facts_md = "\n".join(f"- {fact}" for fact in fact_summaries)
+            with st.expander(f"{badge_label}"):
+                st.markdown("**Facts:**")
+                st.markdown(facts_md)
+                st.markdown("**Source text:**")
+                st.write(raw_text)
+        summary_lines.append(f"See above for {len(seen)} supporting source(s).")
     if result.note:
-        lines.append(f"\n_{result.note}_")
-    return "\n".join(lines)
+        st.markdown(f"_{result.note}_")
+        summary_lines.append(result.note)
+    return "\n".join(summary_lines)

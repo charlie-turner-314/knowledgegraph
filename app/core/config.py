@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings
 class AppSettings(BaseSettings):
     """Central application configuration loaded from env vars or .env."""
 
-    app_name: str = Field(default="Knowledge Graph SME Workbench")
+    app_name: str = Field(default="TAD Knowledge Base")
     database_path: Path = Field(default_factory=lambda: Path.cwd() / "data" / "knowledge_graph.db")
     llm_endpoint: Optional[str] = Field(default=None, alias="LLM_ENDPOINT")
     llm_api_key: Optional[str] = Field(default=None, alias="LLM_API_KEY")
@@ -25,6 +25,7 @@ class AppSettings(BaseSettings):
     llm_temperature_plan: float = Field(default=0.0, alias="LLM_TEMPERATURE_PLAN")
     llm_temperature_answer: float = Field(default=0.3, alias="LLM_TEMPERATURE_ANSWER")
     llm_temperature_connections: float = Field(default=0.0, alias="LLM_TEMPERATURE_CONNECTIONS")
+    llm_temperature_review: float = Field(default=0.15, alias="LLM_TEMPERATURE_REVIEW")
 
     model_config = {
         "env_file": ".env",

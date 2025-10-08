@@ -35,6 +35,7 @@ class QueryMatch:
     subject_attributes: Dict[str, object]
     object_attributes: Dict[str, object]
     tags: List[str]
+    raw_text: str | None = None
 
 
 @dataclass
@@ -374,10 +375,12 @@ class QueryService:
         source = edge.sources[0] if edge.sources else None
         document = None
         page = None
+        raw_text = None
         if source and source.document_chunk:
             if source.document_chunk.document:
                 document = source.document_chunk.document.display_name
             page = source.document_chunk.page_label
+            raw_text = source.document_chunk.text
         subject_attrs = self._node_attribute_map(edge.subject)
         object_attrs = self._node_attribute_map(edge.object)
         tags = sorted({tag.label for tag in (edge.tags or [])})
@@ -391,6 +394,7 @@ class QueryService:
             subject_attributes=subject_attrs,
             object_attributes=object_attrs,
             tags=tags,
+            raw_text=raw_text,
         )
 
     def _keyword_fallback(self, question: str) -> QueryResult:

@@ -1,244 +1,143 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import streamlit as st
 
 from app.data.db import session_scope
-from app.services.review_service import ReviewService
-from app.llm.client import get_client
+from app.services.review_service import ReviewChatOutcome, ReviewService
 
 
 def render() -> None:
-    """Render the SME review queue UI."""
-    st.header("SME Review Queue")
-    st.write("Approve, reject, or refine candidate triples before they enter the graph.")
-
-    if flash := st.session_state.pop("review_flash", None):
-        severity = flash.get("type", "info")
-        message = flash.get("message", "")
-        if severity == "success":
-            st.success(message)
-        elif severity == "error":
-            st.error(message)
-        else:
-            st.info(message)
-
-    pending = _load_pending_serialized()
-    if not pending:
-        st.info("No pending triples. Ingest a document to generate candidates.")
-        return
-
-    _render_collaborative_conversation(pending)
-
-
-def _load_pending_serialized() -> List[Dict[str, Any]]:
-    """Load serialised pending candidates for the summary workflow."""
-    with session_scope() as session:
-        service = ReviewService(session)
-        return service.serialize_pending(limit=50)
-
-
-def _resolve_candidate(*, action: str, candidate_id: int, payload: Dict[str, Any]) -> None:
-    """Execute reviewer actions and update the review flash state."""
-    try:
-        with session_scope() as session:
-            service = ReviewService(session)
-            if action == "approve":
-                service.approve_candidate(
-                    candidate_id,
-                    actor="sme-local",
-                    subject_override=payload.get("subject"),
-                    predicate_override=payload.get("predicate"),
-                    object_override=payload.get("object"),
-                    notes=payload.get("notes"),
-                    subject_attributes=payload.get("subject_attributes"),
-                    object_attributes=payload.get("object_attributes"),
-                    tags=payload.get("tags"),
-                )
-            elif action == "reject":
-                service.reject_candidate(candidate_id, actor="sme-local", reason=payload.get("reason"))
-            elif action == "dismiss_duplicate":
-                service.reject_candidate(candidate_id, actor="sme-local", reason=payload.get("reason"))
-            else:
-                raise ValueError(f"Unknown action {action}")
-    except Exception as exc:  # noqa: BLE001
-        st.session_state["review_flash"] = {"type": "error", "message": str(exc)}
-    else:
-        messages = {
-            "approve": "Candidate approved",
-            "reject": "Candidate rejected",
-            "dismiss_duplicate": "Candidate dismissed as duplicate",
-        }
-        st.session_state["review_flash"] = {
-            "type": "success",
-            "message": messages.get(action, "Candidate updated"),
-        }
-    st.rerun()
-
-
-def _render_collaborative_conversation(candidates: List[Dict[str, Any]]) -> None:
-    st.markdown(
-        f"{len(candidates)} candidate statements awaiting validation. Engage with the assistant below to review and correct the extracted knowledge before committing it to the knowledge graph."
+    """Review assistant chat mirroring the query interface."""
+    st.header("Graph Review Assistant")
+    st.write(
+        "Discuss proposed edits with the review agent. It can inspect recent statements,"
+        " add new connections, and capture provenance directly in the knowledge graph."
     )
 
-    history: List[Dict[str, str]] = st.session_state.setdefault("collab_history", [])
-    summary_cache: Optional[str] = st.session_state.get("collab_summary")
+    history: List[Dict[str, Any]] = st.session_state.setdefault("review_history", [])
 
-    # Persist the current candidates so callbacks (which run in a different
-    # execution context) can access the selected/focus candidate when
-    # generating iterative assistant replies.
-    st.session_state["_collab_candidates"] = candidates
+    snapshot = _load_graph_snapshot()
+    _render_snapshot_sidebar(snapshot)
+    _render_history(history)
 
-    if history:
-        for message in history:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-    else:
-        st.info("Start by requesting a summary of what the assistant learned from the uploaded materials.")
+    prompt = st.chat_input("Ask the review agent to inspect or adjust the graph…")
+    if not prompt:
+        return
 
-    cols = st.columns(2)
-    if cols[0].button("Start conversation", key="collab_generate"):
-        message = _generate_review_summary(candidates, history)
-        history.append({"role": "assistant", "content": message})
-        st.session_state["collab_history"] = history
-        st.session_state["collab_summary"] = message
+    history.append({"role": "user", "content": prompt})
+    st.session_state["review_history"] = history
+
+    try:
+        outcome = _run_review_turn(history)
+    except Exception as exc:  # noqa: BLE001
+        error_message = f"Review agent failed: {exc}"
+        st.session_state["review_history"].append({"role": "assistant", "content": error_message})
+        st.error(error_message)
         st.rerun()
+        return
 
-    if cols[1].button("Clear conversation", key="collab_clear"):
-        st.session_state.pop("collab_history", None)
-        st.session_state.pop("collab_input", None)
-        st.session_state.pop("collab_summary", None)
-        st.rerun()
+    _record_outcome(history, outcome)
+    st.session_state["review_history"] = history
+    st.rerun()
 
-    # Ensure collab_input is present before rendering the widget
-    if "collab_input" not in st.session_state:
-        st.session_state["collab_input"] = ""
 
-    # Clear any previous empty-input warning
-    st.session_state.pop("collab_warning", None)
-
-    def _collab_send_callback() -> None:
-        """Callback invoked by the Send button. Updates history and clears the input.
-
-        This runs inside Streamlit's callback context so modifying
-        st.session_state["collab_input"] is allowed.
-        """
-        user_input = st.session_state.get("collab_input", "")
-        if user_input and user_input.strip():
-            hist = st.session_state.get("collab_history", [])
-            hist.append({"role": "user", "content": user_input.strip()})
-            st.session_state["collab_history"] = hist
-            # Clear the widget value via session_state from inside the callback
-            st.session_state["collab_input"] = ""
-
-            # Generate an iterative assistant reply so the flow behaves like a chat.
-            try:
-                client = get_client()
-                # Choose a focus candidate: prefer the first one if available
-                candidates = st.session_state.get("_collab_candidates") or []
-                candidate_payload = candidates[0] if candidates else {}
-                # Pass the already-updated history to the LLM so it can respond iteratively
-                assistant_reply = client.generate_validation_question(
-                    candidate_payload=candidate_payload, history=st.session_state.get("collab_history", [])
+def _render_snapshot_sidebar(snapshot: Dict[str, Any]) -> None:
+    with st.sidebar:
+        st.subheader("Recent activity")
+        edges = snapshot.get("recent_edges", [])
+        if edges:
+            for edge in edges[:10]:
+                doc_part = f" — {edge['document']}" if edge.get("document") else ""
+                page_part = f" (page {edge['page_label']})" if edge.get("page_label") else ""
+                tag_part = (
+                    f" _(tags: {', '.join(edge['tags'])})_"
+                    if edge.get("tags")
+                    else ""
                 )
-            except Exception as exc:  # noqa: BLE001
-                # Record a flash error and fall back to a simple assistant prompt
-                st.session_state["review_flash"] = {"type": "error", "message": str(exc)}
-                assistant_reply = "I couldn't reach the assistant; please try again later."
-
-            # Append assistant reply to history
-            hist = st.session_state.get("collab_history", [])
-            hist.append({"role": "assistant", "content": assistant_reply})
-            st.session_state["collab_history"] = hist
+                st.markdown(
+                    f"• **{edge.get('subject', '⟪unknown⟫')} — {edge.get('predicate', '?')} — {edge.get('object', '⟪unknown⟫')}**"
+                    f"{doc_part}{page_part}{tag_part}"
+                )
         else:
-            # Set a flag which we will render after the callback
-            st.session_state["collab_warning"] = True
+            st.caption("No recent edges to display yet.")
 
-    user_input = st.text_area("Your response", key="collab_input")
-    st.button("Send", key="collab_send", on_click=_collab_send_callback)
+        nodes = snapshot.get("recent_nodes", [])
+        if nodes:
+            st.divider()
+            st.caption("Latest nodes")
+            for node in nodes[:8]:
+                attrs = node.get("attributes") or {}
+                attr_text = ", ".join(f"{key}={value}" for key, value in attrs.items())
+                detail = f" — {attr_text}" if attr_text else ""
+                st.write(f"• {node.get('label')} ({node.get('entity_type') or 'unspecified'}){detail}")
 
-    # Show warning if callback flagged empty input
-    if st.session_state.pop("collab_warning", False):
-        st.warning("Please enter a response before sending.")
-
-    summary = summary_cache or _conversation_summary(history)
-    if summary:
-        st.caption("Working summary (will be stored when committed):")
-        st.write(summary)
-
-    action_cols = st.columns([0.3, 0.3, 0.3, 0.1])
-    if action_cols[0].button("Generate overall summary", key="collab_generatesummary"):
-        # Clear the current summary immediately
-        st.session_state["collab_summary"] = ""
-        # Show a spinner while the LLM request is in progress
-        with st.spinner("Generating summary..."):
-            summary = _generate_review_summary(candidates, history)
-        # Update session state with the new summary
-        st.session_state["collab_summary"] = summary
-        st.session_state["collab_history"] = history
-        # Force UI refresh to show the new summary
-        st.rerun()
-
-    if action_cols[1].button("Commit to knowledge graph", key="collab_commit"):
-        _finalize_candidates(candidates, summary)
-    if action_cols[2].button("Mark as needs evidence", key="collab_needevidence"):
-        _mark_conversation_needs_evidence(candidates, summary)
-    with action_cols[3]:
-        st.caption("Conversation state stored automatically.")
+        canonical_terms = snapshot.get("canonical_terms", [])
+        if canonical_terms:
+            st.divider()
+            st.caption("Recent canonical terms")
+            for term in canonical_terms[:8]:
+                aliases = term.get("aliases") or []
+                alias_text = f" (aliases: {', '.join(aliases)})" if aliases else ""
+                st.write(f"• {term.get('label')} — {term.get('entity_type') or 'generic'}{alias_text}")
 
 
-def _generate_review_summary(
-    candidates: List[Dict[str, Any]], history: List[Dict[str, str]],
-    allow_questions: bool=True,
-) -> str:
-    client = get_client()
-    payload = [
+def _render_history(history: List[Dict[str, Any]]) -> None:
+    for entry in history:
+        role = entry.get("role", "assistant")
+        content = entry.get("raw_reply") or entry.get("content", "")
+        with st.chat_message(role):
+            st.markdown(content)
+            if entry.get("applied_changes"):
+                st.caption("Applied changes")
+                st.markdown("\n".join(f"- {item}" for item in entry["applied_changes"]))
+            if entry.get("commands"):
+                with st.expander("LLM command payload", expanded=False):
+                    st.json(entry["commands"])
+
+
+def _conversation_payload(history: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    payload: List[Dict[str, str]] = []
+    for entry in history:
+        role = entry.get("role")
+        content = entry.get("content")
+        if role in {"user", "assistant"} and isinstance(content, str):
+            payload.append({"role": role, "content": content})
+    return payload[-12:]
+
+
+def _run_review_turn(history: List[Dict[str, Any]]) -> ReviewChatOutcome:
+    messages = _conversation_payload(history)
+    with session_scope() as session:
+        service = ReviewService(session)
+        with st.spinner("Collaborating with the review agent…"):
+            return service.chat(messages=messages, actor="review-ui")
+
+
+def _record_outcome(history: List[Dict[str, Any]], outcome: ReviewChatOutcome) -> None:
+    applied_changes = outcome.applied_changes or []
+    commands = [command.model_dump() for command in outcome.commands]
+    assistant_content = _assistant_conversation_text(outcome.reply, applied_changes)
+    history.append(
         {
-            "subject": item["subject"],
-            "predicate": item["predicate"],
-            "object": item["object"],
-            "chunk_text": item.get("chunk_text"),
-            "subject_attributes": item.get("subject_attributes") or [],
-            "object_attributes": item.get("object_attributes") or [],
-            "tags": item.get("tags") or [],
+            "role": "assistant",
+            "content": assistant_content,
+            "raw_reply": outcome.reply,
+            "applied_changes": applied_changes,
+            "commands": commands,
         }
-        for item in candidates
-    ]
-    return client.generate_review_summary(candidates=payload, history=history)
+    )
 
 
-def _conversation_summary(history: List[Dict[str, str]], allow_questions: bool=True) -> str:
-    if not history:
-        return ""
-    lines = [f"{message['role']}: {message['content']}" for message in history]
-    return "\n".join(lines)
+def _assistant_conversation_text(reply: str, applied_changes: List[str]) -> str:
+    if not applied_changes:
+        return reply
+    change_lines = "\n".join(f"- {item}" for item in applied_changes)
+    return f"{reply}\n\nApplied changes:\n{change_lines}"
 
 
-def _finalize_candidates(candidates: List[Dict[str, Any]], summary: str) -> None:
+def _load_graph_snapshot() -> Dict[str, Any]:
     with session_scope() as session:
         service = ReviewService(session)
-        service.approve_candidates_bulk(candidates, actor="sme-local", summary=summary or None)
-    st.session_state.pop("collab_history", None)
-    st.session_state.pop("collab_summary", None)
-    st.session_state["review_flash"] = {"type": "success", "message": "Knowledge graph updated."}
-    st.rerun()
-
-
-def _mark_conversation_needs_evidence(candidates: List[Dict[str, Any]], summary: str) -> None:
-    with session_scope() as session:
-        service = ReviewService(session)
-        for candidate in candidates:
-            service.flag_candidate_needs_evidence(
-                candidate_id=candidate["id"],
-                actor="sme-local",
-                rationale=summary or "Additional evidence required",
-                confidence=candidate.get("confidence") or None,
-            )
-    st.session_state.pop("collab_history", None)
-    st.session_state.pop("collab_summary", None)
-    st.session_state["review_flash"] = {
-        "type": "info",
-        "message": "Statements flagged for follow-up evidence."
-    }
-    st.rerun()
+        return service.graph_snapshot()

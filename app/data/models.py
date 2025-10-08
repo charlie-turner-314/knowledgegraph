@@ -251,7 +251,7 @@ class NodeAttribute(SQLModel, table=True):
             name="node_attribute_value_not_null",
         ),
         CheckConstraint(
-            "data_type IN ('string','number','boolean','enum')",
+            "data_type IN ('string','number','boolean','enum','list')",
             name="node_attribute_valid_type",
         ),
         UniqueConstraint("node_id", "name", name="uq_node_attribute_node_name"),
@@ -299,6 +299,7 @@ class OntologySuggestion(SQLModel, table=True):
     confidence: float = Field(default=0.0)
     llm_confidence: Optional[float] = Field(default=None)
     status: OntologySuggestionStatus = Field(default=OntologySuggestionStatus.pending, nullable=False)
+    review_status: str = Field(default="for-review", nullable=False, index=True)  # Tracks review status (e.g., 'for-review', 'approved', 'denied')
     applied_parent_node_id: Optional[int] = Field(foreign_key="nodes.id", default=None)
     raw_llm_response: Optional[str] = Field(default=None)
     created_by: Optional[str] = Field(default="ontology_inference")
