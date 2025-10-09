@@ -5,7 +5,9 @@ import json
 import logging
 import threading
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+from app.data.embedding_persistence import load_embeddings, save_embeddings
 
 import numpy as np
 import requests
@@ -14,6 +16,10 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import Session, func, select
 
 from app.core.config import settings
+
+# Configurable batch size for embedding API calls (OpenAI supports up to 2048)
+DEFAULT_EMBEDDING_BATCH_SIZE = 1024
+from app.llm.client import LLMClient, get_client
 
 from . import models
 from app.utils.ontology import infer_entity_type
@@ -222,8 +228,16 @@ class NodeRepository:
         """Fetch or create a node, lazily attaching canonical metadata if needed."""
         node = self.get_by_label(label)
         if node:
+            changed = False
             if canonical_term and node.canonical_term_id is None:
                 node.canonical_term_id = canonical_term.id
+                changed = True
+            if entity_type and (node.entity_type or "").strip().lower() != entity_type.strip().lower():
+                node.entity_type = entity_type
+                node.sme_override = True
+                changed = True
+            if changed:
+                self.session.add(node)
             return node
         node = models.Node(
             label=label,
@@ -234,6 +248,18 @@ class NodeRepository:
         self.session.add(node)
         self.session.flush()
         return node
+
+    def find_by_label_case_insensitive(self, label: str) -> List[models.Node]:
+        """Return nodes whose label matches ``label`` ignoring case."""
+        cleaned = (label or "").strip()
+        if not cleaned:
+            return []
+        stmt = (
+            select(models.Node)
+            .where(func.lower(models.Node.label) == cleaned.lower())
+            .options(selectinload(models.Node.attributes))
+        )
+        return list(self.session.exec(stmt))
 
 
 class NodeAttributeRepository:
@@ -951,7 +977,9 @@ class NodeEmbeddingStore:
 
     _BACKEND: str = "fuzzy"
     _LABELS: List[str] = []
+    _LABEL_METADATA: List[Dict[str, object]] = []
     _LABEL_TO_INDEX: Dict[str, int] = {}
+    _NODE_ID_TO_INDEX: Dict[int, int] = {}
     _VECTORS: Optional[np.ndarray] = None
     _LOCK = threading.Lock()
     _EMBEDDING_DIM: Optional[int] = None
@@ -960,7 +988,7 @@ class NodeEmbeddingStore:
     _EXTERNAL_DEPLOYMENT: Optional[str] = None
 
     def __init__(self, embedding_model: str = "external"):
-        """Initialise the similarity backend, preferring configured external embeddings."""
+        """Initialise the similarity backend, preferring configured external embeddings. Loads persisted embeddings if available."""
         self.embedding_model = embedding_model
         if settings.embedding_endpoint:
             NodeEmbeddingStore._EXTERNAL_ENDPOINT = settings.embedding_endpoint
@@ -970,10 +998,120 @@ class NodeEmbeddingStore:
         else:
             NodeEmbeddingStore._BACKEND = "fuzzy"
 
+        # Try to load persisted embeddings
+        labels, label_to_index, vectors, embedding_dim, metadata = load_embeddings()
+        if labels:
+            NodeEmbeddingStore._LABELS = list(labels)
+            if metadata and len(metadata) == len(labels):
+                NodeEmbeddingStore._LABEL_METADATA = [dict(item) for item in metadata]
+            else:
+                NodeEmbeddingStore._LABEL_METADATA = [
+                    {"label": label, "entity_type": None, "node_id": None, "kind": "node"}
+                    for label in labels
+                ]
+
+            if label_to_index:
+                NodeEmbeddingStore._LABEL_TO_INDEX = dict(label_to_index)
+            else:
+                NodeEmbeddingStore._LABEL_TO_INDEX = {
+                    label.lower(): idx for idx, label in enumerate(NodeEmbeddingStore._LABELS)
+                }
+
+            NodeEmbeddingStore._VECTORS = vectors
+            NodeEmbeddingStore._EMBEDDING_DIM = embedding_dim
+
+            NodeEmbeddingStore._NODE_ID_TO_INDEX = {}
+            for idx, meta in enumerate(NodeEmbeddingStore._LABEL_METADATA):
+                if not isinstance(meta, dict):
+                    continue
+                meta.setdefault("kind", "node")
+                node_id = meta.get("node_id")
+                if isinstance(node_id, int):
+                    NodeEmbeddingStore._NODE_ID_TO_INDEX[node_id] = idx
+
     @property
     def backend(self) -> str:
         """Return the current similarity backend (``external`` or ``fuzzy``)."""
         return NodeEmbeddingStore._BACKEND
+
+    @staticmethod
+    def _format_label(label: str, entity_type: Optional[str]) -> str:
+        cleaned_label = (label or "").strip()
+        if not cleaned_label:
+            return ""
+        cleaned_type = (entity_type or "").strip()
+        return f"{cleaned_label} [{cleaned_type}]" if cleaned_type else cleaned_label
+
+    @staticmethod
+    def _normalise_entry(entry: object) -> tuple[str, Optional[str], Optional[int], str]:
+        label: Optional[str] = None
+        entity_type: Optional[str] = None
+        node_id: Optional[int] = None
+        kind = "node"
+
+        if entry is None:
+            return "", None, None, kind
+
+        if isinstance(entry, models.Node):
+            label = entry.label
+            entity_type = entry.entity_type
+            node_id = entry.id
+            kind = "node"
+        elif isinstance(entry, dict):
+            label = entry.get("label")  # type: ignore[arg-type]
+            entity_type = entry.get("entity_type")  # type: ignore[arg-type]
+            node_id_raw = entry.get("node_id")
+            if isinstance(node_id_raw, int):
+                node_id = node_id_raw
+            kind = entry.get("kind") or ("predicate" if entity_type == "predicate" else "node")  # type: ignore[arg-type]
+        elif isinstance(entry, (list, tuple)):
+            if entry:
+                label = entry[0] if isinstance(entry[0], str) else str(entry[0])
+            if len(entry) > 1 and entry[1] is not None:
+                entity_type = str(entry[1])
+            if len(entry) > 2 and isinstance(entry[2], int):
+                node_id = entry[2]
+        elif isinstance(entry, str):
+            label = entry
+
+        label = (label or "").strip()
+        if not label:
+            return "", None, None, kind
+
+        if entity_type is not None:
+            entity_type = str(entity_type).strip() or None
+        if kind not in {"node", "predicate"}:
+            kind = "node"
+
+        return label, entity_type, node_id, kind
+
+    @staticmethod
+    def _metadata_for_index(index: int) -> Dict[str, object]:
+        try:
+            meta = NodeEmbeddingStore._LABEL_METADATA[index]
+            if isinstance(meta, dict):
+                return meta
+        except IndexError:
+            pass
+        label = NodeEmbeddingStore._LABELS[index] if index < len(NodeEmbeddingStore._LABELS) else ""
+        return {"label": label, "entity_type": None, "node_id": None, "kind": "node"}
+
+    @staticmethod
+    def _persist_state() -> None:
+        save_embeddings(
+            NodeEmbeddingStore._LABELS,
+            NodeEmbeddingStore._LABEL_TO_INDEX,
+            NodeEmbeddingStore._VECTORS,
+            NodeEmbeddingStore._EMBEDDING_DIM,
+            NodeEmbeddingStore._LABEL_METADATA,
+        )
+
+    @staticmethod
+    def _to_float(value: object) -> float:
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0.0
 
     def has_entries(self) -> bool:
         """Return ``True`` when at least one label has been cached."""
@@ -989,83 +1127,267 @@ class NodeEmbeddingStore:
             return np.empty((0, NodeEmbeddingStore._EMBEDDING_DIM))
         return self._embed_external(labels)
 
-    def bulk_add(self, labels: Sequence[str]) -> None:
-        """Add ``labels`` to the similarity index if not already present."""
-        cleaned = [label.strip() for label in labels if label and isinstance(label, str) and label.strip()]
-        if not cleaned:
+    def bulk_add(self, entries: Sequence[object]) -> None:
+        """Add or refresh embedding entries based on the supplied metadata."""
+        normalized: List[tuple[str, Optional[str], Optional[int], str, str]] = []
+        for entry in entries:
+            label, entity_type, node_id, kind = self._normalise_entry(entry)
+            formatted = self._format_label(label, entity_type)
+            if not formatted:
+                continue
+            normalized.append((label, entity_type, node_id, kind, formatted))
+
+        if not normalized:
             return
+
+        vectors_map: Dict[int, np.ndarray] = {}
+        if NodeEmbeddingStore._BACKEND == "external":
+            # Batch all the formatted labels for embedding at once
+            formatted_labels = [formatted for _, _, _, _, formatted in normalized]
+            if formatted_labels:
+                batch_vectors = self._embed_external(formatted_labels)
+                if batch_vectors is not None and batch_vectors.size:
+                    for idx, vector in enumerate(batch_vectors):
+                        vectors_map[idx] = vector
+                    NodeEmbeddingStore._EMBEDDING_DIM = batch_vectors.shape[1]
+
         with NodeEmbeddingStore._LOCK:
-            to_add: List[str] = []
-            for label in cleaned:
-                key = label.lower()
-                if key in NodeEmbeddingStore._LABEL_TO_INDEX:
-                    continue
-                to_add.append(label)
-            if not to_add:
-                return
+            for idx, (label, entity_type, node_id, kind, formatted) in enumerate(normalized):
+                key = formatted.lower()
+                existing_idx = None
+                if node_id is not None:
+                    existing_idx = NodeEmbeddingStore._NODE_ID_TO_INDEX.get(node_id)
+                if existing_idx is None:
+                    existing_idx = NodeEmbeddingStore._LABEL_TO_INDEX.get(key)
 
-            vectors: Optional[np.ndarray] = None
-            if NodeEmbeddingStore._BACKEND == "external":
-                vectors = self._embed_external(to_add)
+                vector = vectors_map.get(idx)
+                if vector is not None:
+                    NodeEmbeddingStore._EMBEDDING_DIM = vector.shape[0]
 
-            for idx, label in enumerate(to_add):
-                key = label.lower()
-                NodeEmbeddingStore._LABEL_TO_INDEX[key] = len(NodeEmbeddingStore._LABELS)
-                NodeEmbeddingStore._LABELS.append(label)
-                if vectors is not None:
-                    vector = vectors[idx]
-                    if NodeEmbeddingStore._VECTORS is None:
-                        NodeEmbeddingStore._VECTORS = vector.reshape(1, -1)
-                    else:
-                        NodeEmbeddingStore._VECTORS = np.vstack([NodeEmbeddingStore._VECTORS, vector])
+                metadata = {
+                    "label": label,
+                    "entity_type": entity_type,
+                    "node_id": node_id,
+                    "kind": kind,
+                }
 
-    def suggest_similar(self, label: str, top_k: int = 5) -> List[Tuple[str, float]]:
-        """Return up to ``top_k`` labels similar to ``label`` using current backend."""
-        if not NodeEmbeddingStore._LABELS:
-            return []
+                if existing_idx is not None:
+                    old_key = NodeEmbeddingStore._LABELS[existing_idx].lower()
+                    NodeEmbeddingStore._LABEL_TO_INDEX.pop(old_key, None)
+                    NodeEmbeddingStore._LABELS[existing_idx] = formatted
+                    NodeEmbeddingStore._LABEL_METADATA[existing_idx] = metadata
+                    NodeEmbeddingStore._LABEL_TO_INDEX[key] = existing_idx
+                    if node_id is not None:
+                        NodeEmbeddingStore._NODE_ID_TO_INDEX[node_id] = existing_idx
+                    if vector is not None:
+                        if NodeEmbeddingStore._VECTORS is None:
+                            NodeEmbeddingStore._VECTORS = vector.reshape(1, -1)
+                        else:
+                            NodeEmbeddingStore._VECTORS[existing_idx] = vector
+                else:
+                    NodeEmbeddingStore._LABELS.append(formatted)
+                    NodeEmbeddingStore._LABEL_METADATA.append(metadata)
+                    new_index = len(NodeEmbeddingStore._LABELS) - 1
+                    NodeEmbeddingStore._LABEL_TO_INDEX[key] = new_index
+                    if node_id is not None:
+                        NodeEmbeddingStore._NODE_ID_TO_INDEX[node_id] = new_index
+                    if vector is not None:
+                        if NodeEmbeddingStore._VECTORS is None:
+                            NodeEmbeddingStore._VECTORS = vector.reshape(1, -1)
+                        else:
+                            NodeEmbeddingStore._VECTORS = np.vstack([NodeEmbeddingStore._VECTORS, vector])
+                    elif NodeEmbeddingStore._VECTORS is not None and NodeEmbeddingStore._EMBEDDING_DIM:
+                        zeros = np.zeros((1, NodeEmbeddingStore._EMBEDDING_DIM))
+                        NodeEmbeddingStore._VECTORS = np.vstack([NodeEmbeddingStore._VECTORS, zeros])
 
-        label_key = label.lower()
-        results: List[Tuple[str, float]] = []
+            NodeEmbeddingStore._persist_state()
+
+    def suggest_similar_batch(
+        self,
+        labels: List[str],
+        entity_types: Optional[List[Optional[str]]] = None,
+        *,
+        top_k: int = 5,
+        include_predicates: bool = False,
+    ) -> List[List[Dict[str, object]]]:
+        """Return up to ``top_k`` records similar to each label using batched embedding calls."""
+        if not labels or not NodeEmbeddingStore._LABELS:
+            return [[] for _ in labels]
+
+        # Prepare formatted queries
+        if entity_types is None:
+            entity_types = [None] * len(labels)  # type: ignore[assignment]
+        
+        formatted_queries = [
+            self._format_label(label, entity_type) 
+            for label, entity_type in zip(labels, entity_types)
+        ]
+        formatted_keys = [query.lower() for query in formatted_queries]
+        
+        all_results: List[List[Dict[str, object]]] = []
+
         if (
             NodeEmbeddingStore._BACKEND == "external"
             and NodeEmbeddingStore._VECTORS is not None
             and NodeEmbeddingStore._LABELS
         ):
-            embedding = self._embed_external([label])
+            # Batch embed all queries at once
+            embeddings = self._embed_external(formatted_queries)
+            if embeddings is not None and embeddings.size > 0:
+                for i, (formatted_key, query_vector) in enumerate(zip(formatted_keys, embeddings)):
+                    results: List[Dict[str, object]] = []
+                    similarities = NodeEmbeddingStore._VECTORS @ query_vector
+                    order = np.argsort(-similarities)
+                    for idx in order:
+                        meta = self._metadata_for_index(idx)
+                        candidate_label = NodeEmbeddingStore._LABELS[idx]
+                        candidate_key = candidate_label.lower()
+                        if candidate_key == formatted_key:
+                            continue
+                        kind_value = str(meta.get("kind") or "node").lower()
+                        if not include_predicates and kind_value == "predicate":
+                            continue
+                        results.append(
+                            {
+                                "label": meta.get("label"),
+                                "entity_type": meta.get("entity_type"),
+                                "kind": meta.get("kind"),
+                                "node_id": meta.get("node_id"),
+                                "similarity": float(similarities[idx]),
+                            }
+                        )
+                        if len(results) >= top_k:
+                            break
+                    all_results.append(results)
+                return all_results
+            else:
+                logger.warning("Batch embedding call failed during suggest_similar_batch; falling back to fuzzy matching")
+
+        # Fallback to fuzzy matching
+        for formatted_query, formatted_key in zip(formatted_queries, formatted_keys):
+            scores: List[Dict[str, object]] = []
+            for idx, candidate_label in enumerate(NodeEmbeddingStore._LABELS):
+                candidate_key = candidate_label.lower()
+                if candidate_key == formatted_key:
+                    continue
+                meta = self._metadata_for_index(idx)
+                kind_value = str(meta.get("kind") or "node").lower()
+                if not include_predicates and kind_value == "predicate":
+                    continue
+                score = fuzz.token_set_ratio(formatted_query, candidate_label) / 100.0
+                if score > 0:
+                    scores.append(
+                        {
+                            "label": meta.get("label"),
+                            "entity_type": meta.get("entity_type"),
+                            "kind": meta.get("kind"),
+                            "node_id": meta.get("node_id"),
+                            "similarity": float(score),
+                        }
+                    )
+            scores.sort(
+                key=lambda item: NodeEmbeddingStore._to_float(item.get("similarity")),
+                reverse=True,
+            )
+            all_results.append(scores[:top_k])
+        
+        return all_results
+
+    def suggest_similar(
+        self,
+        label: str,
+        entity_type: Optional[str] = None,
+        *,
+        top_k: int = 5,
+        include_predicates: bool = False,
+    ) -> List[Dict[str, object]]:
+        """Return up to ``top_k`` records similar to ``label`` using the current backend."""
+        if not NodeEmbeddingStore._LABELS:
+            return []
+
+        formatted_query = self._format_label(label, entity_type)
+        formatted_key = formatted_query.lower()
+        results: List[Dict[str, object]] = []
+
+        if (
+            NodeEmbeddingStore._BACKEND == "external"
+            and NodeEmbeddingStore._VECTORS is not None
+            and NodeEmbeddingStore._LABELS
+        ):
+            embedding = self._embed_external([formatted_query])
             if embedding is None or embedding.size == 0:
-                logger.warning("External embedding call failed during query; falling back to fuzzy matching")
+                logger.warning(
+                    "External embedding call failed during query; falling back to fuzzy matching"
+                )
             else:
                 query_vector = embedding[0]
                 similarities = NodeEmbeddingStore._VECTORS @ query_vector
                 order = np.argsort(-similarities)
                 for idx in order:
+                    meta = self._metadata_for_index(idx)
                     candidate_label = NodeEmbeddingStore._LABELS[idx]
-                    if candidate_label.lower() == label_key:
+                    candidate_key = candidate_label.lower()
+                    if candidate_key == formatted_key:
                         continue
-                    results.append((candidate_label, float(similarities[idx])))
+                    kind_value = str(meta.get("kind") or "node").lower()
+                    if not include_predicates and kind_value == "predicate":
+                        continue
+                    results.append(
+                        {
+                            "label": meta.get("label"),
+                            "entity_type": meta.get("entity_type"),
+                            "kind": meta.get("kind"),
+                            "node_id": meta.get("node_id"),
+                            "similarity": float(similarities[idx]),
+                        }
+                    )
                     if len(results) >= top_k:
                         break
                 return results
 
-        scores: List[Tuple[str, float]] = []
-        for candidate_label in NodeEmbeddingStore._LABELS:
-            if candidate_label.lower() == label_key:
+        scores: List[Dict[str, object]] = []
+        for idx, candidate_label in enumerate(NodeEmbeddingStore._LABELS):
+            candidate_key = candidate_label.lower()
+            if candidate_key == formatted_key:
                 continue
-            score = fuzz.token_set_ratio(label, candidate_label) / 100.0
+            meta = self._metadata_for_index(idx)
+            kind_value = str(meta.get("kind") or "node").lower()
+            if not include_predicates and kind_value == "predicate":
+                continue
+            score = fuzz.token_set_ratio(formatted_query, candidate_label) / 100.0
             if score > 0:
-                scores.append((candidate_label, float(score)))
-        scores.sort(key=lambda item: item[1], reverse=True)
+                scores.append(
+                    {
+                        "label": meta.get("label"),
+                        "entity_type": meta.get("entity_type"),
+                        "kind": meta.get("kind"),
+                        "node_id": meta.get("node_id"),
+                        "similarity": float(score),
+                    }
+                )
+        scores.sort(
+            key=lambda item: NodeEmbeddingStore._to_float(item.get("similarity")),
+            reverse=True,
+        )
         return scores[:top_k]
 
     def bootstrap_from_session(self, session: Session) -> None:
-        """Populate the store with existing node labels from the database."""
-        labels = [node.label for node in session.exec(select(models.Node)) if node.label]
-        self.bulk_add(labels)
+        """Populate the store with existing node label+class from the database."""
+        nodes = [node for node in session.exec(select(models.Node)) if node.label]
+        self.bulk_add(nodes)
 
-    def query(self, text: str, top_k: int = 8) -> List[Tuple[str, float]]:
-        """Return labels similar to ``text`` using embeddings or fuzzy fallback."""
+    def query(
+        self,
+        text: str,
+        top_k: int = 8,
+        *,
+        include_kinds: Optional[Set[str]] = None,
+    ) -> List[Tuple[str, float]]:
+        """Return (label, score) tuples similar to ``text`` using embeddings or fuzzy fallback."""
         if not NodeEmbeddingStore._LABELS:
             return []
+
+        kinds_filter = {kind.lower() for kind in include_kinds} if include_kinds else None
 
         if (
             NodeEmbeddingStore._BACKEND == "external"
@@ -1079,17 +1401,30 @@ class NodeEmbeddingStore:
                 order = np.argsort(-similarities)
                 results: List[Tuple[str, float]] = []
                 for idx in order[: top_k * 2]:
-                    candidate_label = NodeEmbeddingStore._LABELS[idx]
-                    score = float(similarities[idx])
-                    results.append((candidate_label, score))
-                return sorted(results, key=lambda item: item[1], reverse=True)[:top_k]
+                    meta = self._metadata_for_index(idx)
+                    kind = str(meta.get("kind") or "node").lower()
+                    if kinds_filter and kind not in kinds_filter:
+                        continue
+                    label = str(meta.get("label") or "").strip()
+                    if not label:
+                        continue
+                    results.append((label, float(similarities[idx])))
+                results.sort(key=lambda item: item[1], reverse=True)
+                return results[:top_k]
             logger.warning("External embedding call failed; using fuzzy similarity for '%s'", text)
 
         scores: List[Tuple[str, float]] = []
-        for candidate_label in NodeEmbeddingStore._LABELS:
+        for idx, candidate_label in enumerate(NodeEmbeddingStore._LABELS):
+            meta = self._metadata_for_index(idx)
+            kind = str(meta.get("kind") or "node").lower()
+            if kinds_filter and kind not in kinds_filter:
+                continue
             score = fuzz.token_set_ratio(text, candidate_label) / 100.0
             if score > 0:
-                scores.append((candidate_label, float(score)))
+                label = str(meta.get("label") or "").strip()
+                if not label:
+                    continue
+                scores.append((label, float(score)))
         scores.sort(key=lambda item: item[1], reverse=True)
         return scores[:top_k]
 
@@ -1110,6 +1445,11 @@ class NodeEmbeddingStore:
             headers["api-key"] = NodeEmbeddingStore._EXTERNAL_API_KEY
 
         try:
+            logger.info(
+                "Calling embedding endpoint %s with %d inputs",  # simple one-line log
+                NodeEmbeddingStore._EXTERNAL_ENDPOINT,
+                len(texts),
+            )
             response = requests.post(
                 NodeEmbeddingStore._EXTERNAL_ENDPOINT,
                 headers=headers,
@@ -1157,3 +1497,41 @@ class NodeEmbeddingStore:
         arr = arr / norms
         NodeEmbeddingStore._EMBEDDING_DIM = arr.shape[1]
         return arr
+
+    def embed_texts(self, texts: Sequence[str]) -> Optional[np.ndarray]:
+        """Public wrapper for obtaining embeddings when an external backend is configured."""
+        if not texts:
+            return np.empty((0, NodeEmbeddingStore._EMBEDDING_DIM or 0))
+        if NodeEmbeddingStore._BACKEND != "external":
+            return None
+        return self._embed_external(texts)
+
+    def embed_texts_batched(
+        self, 
+        texts: Sequence[str], 
+        batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE
+    ) -> Optional[np.ndarray]:
+        """Embed texts in batches for better API efficiency with large inputs."""
+        if not texts:
+            return np.empty((0, NodeEmbeddingStore._EMBEDDING_DIM or 0))
+        if NodeEmbeddingStore._BACKEND != "external":
+            return None
+        
+        # For small inputs, use regular method
+        if len(texts) <= batch_size:
+            return self._embed_external(texts)
+        
+        # Process in batches for large inputs
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batch_embeddings = self._embed_external(batch)
+            if batch_embeddings is not None:
+                all_embeddings.append(batch_embeddings)
+            else:
+                # If any batch fails, fall back to fuzzy
+                return None
+        
+        if not all_embeddings:
+            return None
+        return np.vstack(all_embeddings) if len(all_embeddings) > 1 else all_embeddings[0]

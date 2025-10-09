@@ -31,12 +31,53 @@ def render() -> None:
         _render_text_ingest()
 
 
-def _ingest_from_path(path: Path) -> Dict[str, Any]:
+def _ingest_from_path(
+    path: Path,
+    *,
+    plan_placeholder=None,
+    chunk_progress=None,
+) -> Dict[str, Any]:
     """Ingest a file from disk and return a summary dictionary."""
+    plan_state: Dict[str, Any] = {}
+
+    def _on_plan(plan: Dict[str, Any]) -> None:
+        nonlocal plan_state
+        plan_state = plan
+        message = (
+            f"Planned extraction: {plan['total_chunks']} chunk(s), "
+            f"{plan['expected_llm_calls']} LLM call(s), "
+            f"{plan['expected_embedding_batches']} embedding batch(es)."
+        )
+        if plan_placeholder is not None:
+            plan_placeholder.info(message)
+        else:
+            st.info(message)
+        if chunk_progress is not None:
+            if plan["total_chunks"]:
+                chunk_progress.progress(0.0, text="Starting chunk extraction…")
+            else:
+                chunk_progress.progress(1.0, text="No chunks to process")
+
+    def _on_progress(done: int, total: int) -> None:
+        if chunk_progress is None:
+            return
+        if not total:
+            chunk_progress.progress(1.0, text="No chunks to process")
+            return
+        fraction = min(max(done / total, 0.0), 1.0)
+        chunk_progress.progress(fraction, text=f"LLM extraction {done}/{total} chunk(s)")
+
     with session_scope() as session:
         orchestrator = ExtractionOrchestrator(session)
-        result = orchestrator.ingest_file(path)
+        result = orchestrator.ingest_file(
+            path,
+            plan_callback=_on_plan,
+            progress_callback=_on_progress,
+        )
         session.flush()
+
+        if chunk_progress is not None:
+            chunk_progress.progress(1.0, text="Extraction complete")
 
         duplicate_count = sum(1 for c in result.candidate_triples if c.is_potential_duplicate)
         summary = {
@@ -50,16 +91,61 @@ def _ingest_from_path(path: Path) -> Dict[str, Any]:
             "edges": len(result.edges),
             "duplicates": duplicate_count,
             "existing_document": result.was_existing_document,
+            "stats": result.stats,
         }
+    if plan_placeholder is not None:
+        plan_placeholder.empty()
+    if chunk_progress is not None:
+        chunk_progress.empty()
     return summary
 
 
-def _ingest_from_text(text: str, title: str) -> Dict[str, Any]:
+def _ingest_from_text(
+    text: str,
+    title: str,
+    *,
+    plan_placeholder=None,
+    chunk_progress=None,
+) -> Dict[str, Any]:
     """Ingest manually supplied ``text`` and return the resulting summary."""
+
+    def _on_plan(plan: Dict[str, Any]) -> None:
+        message = (
+            f"Planned extraction: {plan['total_chunks']} chunk(s), "
+            f"{plan['expected_llm_calls']} LLM call(s), "
+            f"{plan['expected_embedding_batches']} embedding batch(es)."
+        )
+        if plan_placeholder is not None:
+            plan_placeholder.info(message)
+        else:
+            st.info(message)
+        if chunk_progress is not None:
+            if plan["total_chunks"]:
+                chunk_progress.progress(0.0, text="Starting chunk extraction…")
+            else:
+                chunk_progress.progress(1.0, text="No chunks to process")
+
+    def _on_progress(done: int, total: int) -> None:
+        if chunk_progress is None:
+            return
+        if not total:
+            chunk_progress.progress(1.0, text="No chunks to process")
+            return
+        fraction = min(max(done / total, 0.0), 1.0)
+        chunk_progress.progress(fraction, text=f"LLM extraction {done}/{total} chunk(s)")
+
     with session_scope() as session:
         orchestrator = ExtractionOrchestrator(session)
-        result = orchestrator.ingest_text(text=text, title=title)
+        result = orchestrator.ingest_text(
+            text=text,
+            title=title,
+            plan_callback=_on_plan,
+            progress_callback=_on_progress,
+        )
         session.flush()
+
+        if chunk_progress is not None:
+            chunk_progress.progress(1.0, text="Extraction complete")
 
         duplicate_count = sum(1 for c in result.candidate_triples if c.is_potential_duplicate)
         summary = {
@@ -73,7 +159,12 @@ def _ingest_from_text(text: str, title: str) -> Dict[str, Any]:
             "edges": len(result.edges),
             "duplicates": duplicate_count,
             "existing_document": result.was_existing_document,
+            "stats": result.stats,
         }
+    if plan_placeholder is not None:
+        plan_placeholder.empty()
+    if chunk_progress is not None:
+        chunk_progress.empty()
     return summary
 
 
@@ -102,7 +193,13 @@ def _render_file_ingest() -> None:
         progress.progress((idx - 0.5) / total, text=f"Processing {file.name} ({idx}/{total})…")
         try:
             stored_path = store_uploaded_file(file.name, file)
-            summary = _ingest_from_path(stored_path)
+            plan_placeholder = st.empty()
+            chunk_progress = st.progress(0.0, text="Preparing extraction…")
+            summary = _ingest_from_path(
+                stored_path,
+                plan_placeholder=plan_placeholder,
+                chunk_progress=chunk_progress,
+            )
             summaries.append((file.name, summary))
         except Exception as exc:  # noqa: BLE001
             st.error(f"Failed to ingest {file.name}: {exc}")

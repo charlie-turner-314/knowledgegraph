@@ -1,0 +1,32 @@
+{
+  "timestamp": "20251009_122214",
+  "error_type": "ValueError",
+  "error_message": "Failed to parse JSON response",
+  "request_payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "Extract triples from text"
+      },
+      {
+        "role": "user",
+        "content": "This is a test chunk of text for extraction"
+      }
+    ],
+    "temperature": 0.1,
+    "response_format": {
+      "type": "json_object"
+    }
+  },
+  "response_data": {
+    "error": "Invalid JSON response",
+    "choices": [
+      {
+        "message": {
+          "content": "malformed json {"
+        }
+      }
+    ]
+  },
+  "chunk_preview": "This is a test chunk of text for extraction"
+}

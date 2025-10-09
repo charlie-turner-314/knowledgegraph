@@ -11,6 +11,7 @@ class ChunkPayload:
     text: str
     page_label: Optional[str] = None
     token_count: Optional[int] = None
+    metadata: Optional[dict] = None
 
 
 @dataclass

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# pyright: reportGeneralTypeIssues=false
+
 import re
 import logging
 from collections import defaultdict
@@ -133,11 +135,48 @@ class QueryService:
 
     def _build_retrieval_context(self, question: str) -> Dict[str, object]:
         """Assemble candidate nodes/edges and metadata for LLM retrieval planning."""
-        top_nodes = self._rank_nodes(question, top_k=8)
+        raw_rankings = self._rank_nodes(question, top_k=8)
+        top_nodes: List[Tuple[str, float]] = []
+        seen_labels: set[str] = set()
+        for entry in raw_rankings:
+            label: Optional[str] = None
+            score = 0.0
+
+            if isinstance(entry, dict):
+                raw_label = entry.get("label")
+                label = raw_label if isinstance(raw_label, str) else str(raw_label or "")
+                raw_score = entry.get("similarity")
+                try:
+                    score = float(raw_score) if raw_score is not None else 0.0
+                except (TypeError, ValueError):
+                    score = 0.0
+            elif isinstance(entry, (list, tuple)):
+                if entry:
+                    label = str(entry[0])
+                if len(entry) > 1:
+                    try:
+                        score = float(entry[1])  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        score = 0.0
+            elif isinstance(entry, str):
+                label = entry
+            elif entry is not None:
+                label = str(entry)
+
+            cleaned = (label or "").strip()
+            if not cleaned:
+                continue
+
+            key = cleaned.lower()
+            if key in seen_labels:
+                continue
+            seen_labels.add(key)
+            top_nodes.append((cleaned, score))
+
         node_labels = [item[0] for item in top_nodes]
         nodes = self._load_nodes_by_labels(node_labels)
 
-        score_lookup = {label.lower(): score for label, score in top_nodes}
+        similarity_lookup = {label.lower(): score for label, score in top_nodes}
 
         node_id_to_label = {node.id: node.label for node in nodes}
         edges = self._load_edges_for_nodes(node_id_to_label.keys(), sample_limit=20)
@@ -147,7 +186,7 @@ class QueryService:
                 "id": node.id,
                 "label": node.label,
                 "entity_type": node.entity_type,
-                "score": score_lookup.get((node.label or "").lower()),
+                "similarity": similarity_lookup.get((node.label or "").lower()),
                 "attributes": self._serialize_node_attributes(node),
             }
             for node in nodes
@@ -402,7 +441,6 @@ class QueryService:
         keywords = {
             word.lower()
             for word in re.findall(r"[A-Za-z0-9]+", question)
-            if len(word) > 3
         }
         if not keywords:
             return QueryResult(

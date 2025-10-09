@@ -130,6 +130,13 @@ class ConnectionRecommendationResponse(BaseModel):
     raw_response: dict = Field(default_factory=dict)
 
 
+class NodeMergeDecision(BaseModel):
+    use_existing: bool = Field(default=False)
+    preferred_label: Optional[str] = None
+    reason: Optional[str] = None
+    raw_response: dict = Field(default_factory=dict)
+
+
 class ReviewAgentCommand(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 

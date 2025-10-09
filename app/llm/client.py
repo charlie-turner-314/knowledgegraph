@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import logging
 import re
+import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -22,10 +23,44 @@ from .schemas import (
     QueryPlanResponse,
     QueryRetrievalResponse,
     ReviewAgentResponse,
+    NodeMergeDecision,
     RetrievalNode,
 )
 
 logger = logging.getLogger(__name__)
+
+def _log_extraction_failure(request_payload: Dict[str, Any], response_data: Dict[str, Any], error: Exception) -> None:
+    """Log detailed information about LLM extraction failures to a file."""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    failure_data = {
+        "timestamp": timestamp,
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "request_payload": request_payload,
+        "response_data": response_data,
+        "chunk_preview": request_payload.get("messages", [])[-1].get("content", "")[:500] if request_payload.get("messages") else "",
+    }
+    
+    # Create logs directory if it doesn't exist
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    
+    # Save to timestamped file
+    failure_file = logs_dir / f"llm_extraction_failure_{timestamp}.json"
+    try:
+        with open(failure_file, "wb") as f:
+            f.write(orjson.dumps(failure_data, option=orjson.OPT_INDENT_2))
+        logger.error(f"LLM extraction failure logged to {failure_file}")
+    except Exception as log_error:
+        logger.error(f"Failed to log extraction failure: {log_error}")
+        # Fallback to current directory
+        fallback_file = f"llm_extraction_failure_{timestamp}.json"
+        try:
+            with open(fallback_file, "wb") as f:
+                f.write(orjson.dumps(failure_data, option=orjson.OPT_INDENT_2))
+            logger.error(f"LLM extraction failure logged to {fallback_file}")
+        except Exception as fallback_error:
+            logger.error(f"Failed to log extraction failure even to fallback location: {fallback_error}")
 
 PROMPT_PATH = Path(__file__).resolve().parents[2] / "resources" / "prompts" / "extraction_system_prompt.txt"
 EXTRACTION_SUMMARY_PROMPT_PATH = (
@@ -48,6 +83,9 @@ CONNECTION_RECOMMENDATION_PROMPT_PATH = (
 )
 CANDIDATE_VALIDATION_PROMPT_PATH = (
     Path(__file__).resolve().parents[2] / "resources" / "prompts" / "candidate_validation_prompt.txt"
+)
+NODE_MERGE_PROMPT_PATH = (
+    Path(__file__).resolve().parents[2] / "resources" / "prompts" / "node_merge_prompt.txt"
 )
 REVIEW_SUMMARY_PROMPT_PATH = (
     Path(__file__).resolve().parents[2] / "resources" / "prompts" / "review_summary_prompt.txt"
@@ -139,6 +177,21 @@ def _load_candidate_validation_prompt() -> str:
 
 
 @functools.lru_cache(maxsize=1)
+def _load_node_merge_prompt() -> str:
+    try:
+        return NODE_MERGE_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.warning(
+            "Node merge prompt file %s missing; using fallback text",
+            NODE_MERGE_PROMPT_PATH,
+        )
+        return (
+            "Decide whether a candidate node should reuse an existing node label. "
+            "Respond with JSON containing use_existing, preferred_label, and reason."
+        )
+
+
+@functools.lru_cache(maxsize=1)
 def _load_review_summary_prompt() -> str:
     try:
         return REVIEW_SUMMARY_PROMPT_PATH.read_text(encoding="utf-8").strip()
@@ -198,11 +251,34 @@ class LLMClient:
                 headers["api-key"] = f"{self.api_key}"
             else:
                 headers["Authorization"] = f"Bearer {self.api_key}"
+        
+        # Log request details for debugging
         logger.info("Calling LLM endpoint %s", self.endpoint)
-        response = requests.post(self.endpoint, headers=headers, data=orjson.dumps(payload))
-        logger.info("Received response with status %s", response.status_code)
-        response.raise_for_status()
-        return response.json()
+        logger.debug("Request payload keys: %s", list(payload.keys()))
+        if "messages" in payload:
+            logger.debug("Message count: %d", len(payload["messages"]))
+            # Log a preview of the user content for debugging (truncated)
+            user_messages = [msg for msg in payload["messages"] if msg.get("role") == "user"]
+            if user_messages:
+                content_preview = user_messages[-1].get("content", "")[:200]
+                logger.debug("User content preview: %s...", content_preview)
+        
+        try:
+            response = requests.post(self.endpoint, headers=headers, data=orjson.dumps(payload))
+            logger.info("Received response with status %s", response.status_code)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as exc:
+            logger.error("HTTP request failed: %s", exc)
+            if hasattr(exc, 'response') and exc.response is not None:
+                logger.error("Response status: %s", exc.response.status_code)
+                logger.error("Response content: %s", exc.response.text[:500])
+                with open("logs/llm_api_error_response.json", "wb") as f:
+                    f.write(orjson.dumps({
+                        "status_code": exc.response.status_code,
+                        "content": exc.response.text,
+                    }, option=orjson.OPT_INDENT_2))
+            raise
 
     def extract_triples(
         self,
@@ -210,9 +286,10 @@ class LLMClient:
         chunk_text: str,
         metadata: Optional[Dict[str, Any]] = None,
         canonical_context: Optional[List[Dict[str, Any]]] = None,
-        predefined_ontology: Optional[Dict[str, Any]] = None,  # Added predefined ontology
-    running_summary: Optional[str] = None,
-    entity_memory: Optional[List[Dict[str, Any]]] = None,
+        predefined_ontology: Optional[Dict[str, Any]] = None,
+        running_summary: Optional[str] = None,
+        entity_memory: Optional[List[Dict[str, Any]]] = None,
+        ontology_context: Optional[Dict[str, Any]] = None,
     ) -> ExtractionResponse:
         """Call the configured LLM to extract triples from text."""
 
@@ -253,6 +330,18 @@ class LLMClient:
                     "content": (
                         "Canonical vocabulary for this project (JSON). Use labels when aliases match.\n"
                         f"{orjson.dumps(canonical_payload).decode()}"
+                    ),
+                }
+            )
+
+        if ontology_context:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Ontology entries most relevant to this chunk (JSON). Prioritise these labels "
+                        "for entity typing and predicate selection when evidence supports them.\n"
+                        f"{orjson.dumps(ontology_context).decode()}"
                     ),
                 }
             )
@@ -310,6 +399,7 @@ class LLMClient:
             raw = self._call_api(payload)
         except RetryError as exc:
             logger.exception("LLM triple extraction failed after retries")
+            _log_extraction_failure(payload, {}, exc)
             raise RuntimeError("LLM triple extraction failed") from exc
 
         try:
@@ -338,9 +428,11 @@ class LLMClient:
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to parse LLM extraction response")
+            _log_extraction_failure(payload, raw or {}, exc)
+            # Keep the old file for backward compatibility
             with open(".llm_extraction_error.json", "wb") as f:
                 f.write(orjson.dumps(raw or {}, option=orjson.OPT_INDENT_2))
-            raise RuntimeError("Invalid response from LLM extraction endpoint. Output saved to .llm_extraction_error.json") from exc
+            raise RuntimeError("Invalid response from LLM extraction endpoint. Detailed failure logged to logs/ directory") from exc
 
         return parsed
 

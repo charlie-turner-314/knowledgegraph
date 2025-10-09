@@ -16,10 +16,20 @@ def render() -> None:
 
     for entry in st.session_state["query_history"]:
         with st.chat_message(entry["role"]):
-            if isinstance(entry["content"], str):
-                st.markdown(entry["content"])
+            content = entry.get("content")
+            if (
+                entry["role"] == "assistant"
+                and isinstance(content, dict)
+                and content.get("type") == "query_result"
+            ):
+                summary = _render_query_result(content["result"])
+                content["summary"] = summary
+                if summary:
+                    st.caption(summary)
+            elif isinstance(content, str):
+                st.markdown(content)
             else:
-                st.write(entry["content"])
+                st.write(content)
 
     prompt = st.chat_input("What would you like to know?")
     if not prompt:
@@ -39,15 +49,24 @@ def render() -> None:
 
     status_placeholder.success("Answer ready")
 
-    response_content = _format_query_result(result)
-    st.session_state["query_history"].append({"role": "assistant", "content": response_content})
+    summary = _render_query_result(result)
+    st.session_state["query_history"].append(
+        {
+            "role": "assistant",
+            "content": {
+                "type": "query_result",
+                "result": result,
+                "summary": summary,
+            },
+        }
+    )
     st.rerun()
 
 
 
 
 
-def _format_query_result(result: QueryResult) -> str:
+def _render_query_result(result: QueryResult) -> str:
     """Render a QueryResult using Streamlit widgets for proper formatting, and return a summary for chat history."""
     summary_lines = []
     if result.answers:

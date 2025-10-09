@@ -20,4 +20,5 @@ tenacity>=8.2
 orjson>=3.10
 rapidfuzz>=3.8
 tiktoken>=0.7
+pytesseract>=0.3.11
 pdoc>=14.0

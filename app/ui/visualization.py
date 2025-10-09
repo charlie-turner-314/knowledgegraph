@@ -195,7 +195,7 @@ def _build_legend(color_lookup: Dict[str, str]) -> List[str]:
 
 
 def _format_node_tooltip(node: Dict[str, Any]) -> str:
-    lines = [f"<strong>{node['label']}</strong>"]
+    lines = [f"{node['label']}"]
     entity_type = node.get("entity_type")
     if entity_type:
         lines.append(f"Type: {entity_type}")
@@ -204,12 +204,12 @@ def _format_node_tooltip(node: Dict[str, Any]) -> str:
     canonical = node.get("canonical_label")
     if canonical:
         lines.append(f"Canonical: {canonical}")
-    return "<br/>".join(lines)
+    return "\n".join(lines)
 
 
 def _format_edge_tooltip(edge: Dict[str, Any]) -> str:
-    lines = [f"<strong>{edge['predicate']}</strong>"]
-    lines.append(f"{edge['subject_label']} → {edge['object_label']}")
+    lines = [f"{edge['predicate']}"]
+    lines.append(f"{edge['subject_label']} -> {edge['object_label']}")
     tags = edge.get("tags") or []
     if tags:
         lines.append("Tags: " + ", ".join(tags))
@@ -222,4 +222,4 @@ def _format_edge_tooltip(edge: Dict[str, Any]) -> str:
         else:
             source_type = source.get("type") or "unknown"
             lines.append(f"Source: {source_type}")
-    return "<br/>".join(filter(None, lines))
+    return "\n".join(filter(None, lines))

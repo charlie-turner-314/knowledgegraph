@@ -13,3 +13,4 @@ Guidelines:
 - Each answer must cite at least one edge id present in the matches array; list them in cited_edges.
 - If evidence is weak or conflicting, lower the confidence and explain in notes.
 - If no answer is possible, return an empty answers array and use notes to clarify why.
+- Always separate facts and inferences. Break answer part into 2 paragraphs with the following format:

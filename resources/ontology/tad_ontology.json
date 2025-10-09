@@ -12,13 +12,16 @@
     "OEM",
     "Organization",
     "Person",
-    "Specification",
     "Technology",
     "Test_Condition",
     "Test_Equipment",
     "Test_Type",
     "TRL",
-    "Validation_Method"
+    "Validation_Method",
+    "Qualitative_Specification",
+    "Quantitative_Specification",
+    "Risk",
+    "Mitigation_Strategy"
   ],
   "relationships": [
     "developed_by",
@@ -37,7 +40,6 @@
     "located_in",
     "operate_in",
     "partnered_with",
-    "produce_majority_of",
     "produces",
     "supplies_to",
     "under_test_condition",
@@ -46,5 +48,5 @@
     "uses_technology",
     "uses_test_equipment",
     "validated_by"
-  ]
+  ] 
 }

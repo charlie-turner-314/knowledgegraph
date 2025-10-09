@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+import io
+import logging
 import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+from .chunking import TextBlock, chunk_blocks, chunk_text
 from .types import ChunkPayload, ParsedDocument
 from .utils import compute_checksum
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,7 +43,7 @@ class TextParser(DocumentParser):
 
     def parse(self, ctx: ParserContext) -> ParsedDocument:
         text = ctx.path.read_text(encoding="utf-8")
-        chunks = [ChunkPayload(ordering=idx, text=line.strip()) for idx, line in enumerate(text.splitlines()) if line.strip()]
+        chunks = chunk_text(text)
         if not chunks:
             chunks = [ChunkPayload(ordering=0, text=text)]
         return ParsedDocument(
@@ -61,13 +68,15 @@ class PDFParser(DocumentParser):
                 text = page.extract_text() or ""
                 if not text.strip():
                     continue
-                chunks.append(
-                    ChunkPayload(
-                        ordering=idx,
-                        text=text.strip(),
-                        page_label=str(page.page_number),
-                    )
+                page_chunks = chunk_text(
+                    text.strip(),
+                    page_label=str(page.page_number),
                 )
+                if not page_chunks:
+                    continue
+                for chunk in page_chunks:
+                    chunk.ordering = len(chunks)
+                    chunks.append(chunk)
         return ParsedDocument(
             display_name=ctx.path.name,
             media_type=ctx.media_type,
@@ -85,13 +94,18 @@ class DocxParser(DocumentParser):
 
     def parse(self, ctx: ParserContext) -> ParsedDocument:
         import docx
-
-        document = docx.Document(ctx.path)
+        document = docx.Document(str(ctx.path))
         text_blocks = [p.text.strip() for p in document.paragraphs if p.text.strip()]
-        chunks = [
-            ChunkPayload(ordering=idx, text=block)
-            for idx, block in enumerate(text_blocks)
-        ]
+        if text_blocks:
+            block_payloads = [TextBlock(text=block) for block in text_blocks]
+            chunks = chunk_blocks(block_payloads)
+        else:
+            chunks = []
+        if not chunks:
+            full_text = "\n".join(text_blocks) if text_blocks else ""
+            chunks = chunk_text(full_text or "") or [ChunkPayload(ordering=0, text=full_text)]
+        for idx, chunk in enumerate(chunks):
+            chunk.ordering = idx
         return ParsedDocument(
             display_name=ctx.path.name,
             media_type=ctx.media_type,
@@ -109,25 +123,144 @@ class PptxParser(DocumentParser):
 
     def parse(self, ctx: ParserContext) -> ParsedDocument:
         from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-        presentation = Presentation(ctx.path)
+        try:
+            import pytesseract  # type: ignore[import]
+        except ImportError as exc:  # pragma: no cover - dependency missing at runtime
+            raise RuntimeError(
+                "pytesseract is required for PPTX image OCR. Install it via pip and ensure the"
+                " Tesseract OCR engine is available on the system PATH."
+            ) from exc
+
+        try:
+            from PIL import Image  # type: ignore[import]
+        except ImportError as exc:  # pragma: no cover - dependency missing at runtime
+            raise RuntimeError(
+                "Pillow is required for PPTX image OCR. Install it via pip before ingesting slides"
+                " that contain images."
+            ) from exc
+
+        presentation = Presentation(str(ctx.path))
         chunks: List[ChunkPayload] = []
+        seen_hashes: set[str] = set()
+        image_counter = 0
+        # Collect all slide texts and OCR results as (slide_idx, text, provenance_type, extra_metadata)
+        slide_texts = []
         for idx, slide in enumerate(presentation.slides):
             lines: List[str] = []
             for shape in slide.shapes:
                 if hasattr(shape, "text"):
-                    text = shape.text.strip()
+                    text = str(getattr(shape, "text", "")).strip()
                     if text:
                         lines.append(text)
-            if not lines:
-                continue
-            chunks.append(
-                ChunkPayload(
-                    ordering=idx,
-                    text="\n".join(lines),
-                    page_label=f"slide-{idx + 1}",
+                if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.PICTURE:
+                    image = getattr(shape, "image", None)
+                    if image is None:
+                        continue
+                    blob = image.blob
+                    digest = hashlib.sha256(blob).hexdigest()
+                    if digest in seen_hashes:
+                        continue
+                    seen_hashes.add(digest)
+                    image_counter += 1
+                    try:
+                        with Image.open(io.BytesIO(blob)) as img:
+                            if img.mode in ('RGBA', 'LA', 'P'):
+                                img = img.convert('RGB')
+                            ocr_text = pytesseract.image_to_string(img)
+                    except pytesseract.TesseractNotFoundError as exc:
+                        raise RuntimeError(
+                            "Tesseract OCR executable not found. Install it locally and ensure it is"
+                            " accessible on the system PATH before ingesting PPTX images."
+                        ) from exc
+                    except (TypeError, OSError) as exc:
+                        logger.warning(
+                            "Skipping unsupported image format in slide %s image %s of %s: %s",
+                            idx + 1,
+                            image_counter,
+                            ctx.path,
+                            exc,
+                        )
+                        continue
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "Failed to run OCR for slide %s image %s in %s",
+                            idx + 1,
+                            image_counter,
+                            ctx.path,
+                        )
+                        continue
+
+                    cleaned = (ocr_text or "").strip()
+                    if cleaned:
+                        slide_texts.append((idx + 1, cleaned, "image_ocr", {
+                            "image_index": image_counter,
+                            "image_hash": digest,
+                        }))
+            if lines:
+                block_text = "\n".join(lines)
+                slide_texts.append((idx + 1, block_text, "slide_text", {}))
+
+        # Now batch across slides until token limit is hit
+        from .chunking import chunk_blocks, TextBlock, DEFAULT_MAX_TOKENS, DEFAULT_OVERLAP_TOKENS, DEFAULT_ENCODING
+        current_texts = []
+        current_slide_indices = []
+        current_types = []
+        current_metadata = []
+        encoder = None
+        for slide_idx, text, prov_type, extra_meta in slide_texts:
+            if encoder is None:
+                import tiktoken
+                encoder = tiktoken.get_encoding(DEFAULT_ENCODING)
+            # If adding this text would exceed the token limit, flush current chunk
+            tokens_in_text = len(encoder.encode(text))
+            tokens_in_current = len(encoder.encode("\n".join(current_texts))) if current_texts else 0
+            if current_texts and (tokens_in_current + tokens_in_text > DEFAULT_MAX_TOKENS):
+                chunk_text_combined = "\n".join(current_texts)
+                chunk_blocks_result = chunk_blocks(
+                    [TextBlock(text=chunk_text_combined)],
+                    max_tokens=DEFAULT_MAX_TOKENS,
+                    overlap_tokens=DEFAULT_OVERLAP_TOKENS,
+                    encoding_name=DEFAULT_ENCODING,
                 )
+                slide_range = f"{current_slide_indices[0]}-{current_slide_indices[-1]}" if len(current_slide_indices) > 1 else str(current_slide_indices[0])
+                for chunk in chunk_blocks_result:
+                    chunk.ordering = len(chunks)
+                    chunk.metadata = {
+                        "source": ",".join(set(current_types)),
+                        "slide_range": slide_range,
+                        "slide_indices": list(current_slide_indices),
+                        **(current_metadata[0] if current_metadata else {}),
+                    }
+                    chunks.append(chunk)
+                current_texts = []
+                current_slide_indices = []
+                current_types = []
+                current_metadata = []
+            current_texts.append(text)
+            current_slide_indices.append(slide_idx)
+            current_types.append(prov_type)
+            current_metadata.append(extra_meta)
+        # Flush any remaining text
+        if current_texts:
+            chunk_text_combined = "\n".join(current_texts)
+            chunk_blocks_result = chunk_blocks(
+                [TextBlock(text=chunk_text_combined)],
+                max_tokens=DEFAULT_MAX_TOKENS,
+                overlap_tokens=DEFAULT_OVERLAP_TOKENS,
+                encoding_name=DEFAULT_ENCODING,
             )
+            slide_range = f"{current_slide_indices[0]}-{current_slide_indices[-1]}" if len(current_slide_indices) > 1 else str(current_slide_indices[0])
+            for chunk in chunk_blocks_result:
+                chunk.ordering = len(chunks)
+                chunk.metadata = {
+                    "source": ",".join(set(current_types)),
+                    "slide_range": slide_range,
+                    "slide_indices": list(current_slide_indices),
+                    **(current_metadata[0] if current_metadata else {}),
+                }
+                chunks.append(chunk)
         return ParsedDocument(
             display_name=ctx.path.name,
             media_type=ctx.media_type,
